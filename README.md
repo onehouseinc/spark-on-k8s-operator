@@ -6,8 +6,10 @@ Forked On Aug-4-2021
 # Steps to create image
 
 ```
-aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/n6s8c1t1
-docker build -t spark-operator-with-aws-jars .
-docker tag spark-operator-with-aws-jars:latest public.ecr.aws/n6s8c1t1/spark-operator-with-aws-jars:latest
-docker push public.ecr.aws/n6s8c1t1/spark-operator-with-aws-jars:latest
+export AWS_PROFILE=prod_onehouse_debug
+
+aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin 194159489498.dkr.ecr.us-west-1.amazonaws.com
+docker build -t onehouse-spark-operator .
+docker tag onehouse-spark-operator:latest 194159489498.dkr.ecr.us-west-1.amazonaws.com/onehouse-spark-operator:latest
+docker push 194159489498.dkr.ecr.us-west-1.amazonaws.com/onehouse-spark-operator:latest
 ```
