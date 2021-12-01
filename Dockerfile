@@ -38,14 +38,11 @@ FROM ${SPARK_IMAGE}
 USER root
 
 # Add AWS Jars
-ADD https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.2.0/hadoop-aws-3.2.0.jar $SPARK_HOME/jars
-RUN chmod 644 $SPARK_HOME/jars/hadoop-aws-3.2.0.jar
+ADD https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.1.1/hadoop-aws-3.1.1.jar $SPARK_HOME/jars
+RUN chmod 644 $SPARK_HOME/jars/hadoop-aws-3.1.1.jar
 
-ADD https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.48/aws-java-sdk-bundle-1.12.48.jar $SPARK_HOME/jars
-RUN chmod 644 $SPARK_HOME/jars/aws-java-sdk-bundle-1.12.48.jar
-
-ADD https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-glue/1.12.48/aws-java-sdk-glue-1.12.48.jar $SPARK_HOME/jars
-RUN chmod 644 $SPARK_HOME/jars/aws-java-sdk-glue-1.12.48.jar
+ADD https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.11.814/aws-java-sdk-bundle-1.11.814.jar $SPARK_HOME/jars
+RUN chmod 644 $SPARK_HOME/jars/aws-java-sdk-bundle-1.11.814.jar
 
 ADD https://repo1.maven.org/maven2/org/apache/spark/spark-avro_2.12/3.1.1/spark-avro_2.12-3.1.1.jar $SPARK_HOME/jars
 RUN chmod 644 $SPARK_HOME/jars/spark-avro_2.12-3.1.1.jar
