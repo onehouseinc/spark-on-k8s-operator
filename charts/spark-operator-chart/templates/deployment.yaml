@@ -88,11 +88,18 @@ spec:
         {{- end }}
         resources:
           {{- toYaml .Values.resources | nindent 10 }}
-      {{- if .Values.webhook.enable }}
         volumeMounts:
+          - name: pod-templates
+            mountPath: /etc/pod-templates/
+        {{- if .Values.webhook.enable }}
           - name: webhook-certs
             mountPath: /etc/webhook-certs
+        {{- end }}
       volumes:
+        - name: pod-templates
+          configMap:
+            name: pod-templates
+      {{- if .Values.webhook.enable }}
         - name: webhook-certs
           secret:
             secretName: {{ include "spark-operator.fullname" . }}-webhook-certs
