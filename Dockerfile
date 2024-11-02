@@ -37,17 +37,27 @@ FROM ${SPARK_IMAGE}
 
 USER root
 
-RUN apt-get update \
-    && apt-get install -y tini \
+# Add AWS Jars
+ADD https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar $SPARK_HOME/jars
+RUN chmod 644 $SPARK_HOME/jars/hadoop-aws-3.3.4.jar
+
+ADD https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.691/aws-java-sdk-bundle-1.12.691.jar $SPARK_HOME/jars
+RUN chmod 644 $SPARK_HOME/jars/aws-java-sdk-bundle-1.11.814.jar
+
+ADD https://repo1.maven.org/maven2/org/apache/spark/spark-avro_2.13/3.3.4/spark-avro_2.13-3.3.4.jar $SPARK_HOME/jars
+RUN chmod 644 $SPARK_HOME/jars/spark-avro_2.12-3.1.1.jar
+
+# Add gcs connector
+ADD https://storage.googleapis.com/hadoop-lib/gcs/gcs-connector-hadoop3-latest.jar  $SPARK_HOME/jars
+RUN chmod 644 $SPARK_HOME/jars/gcs-connector-hadoop3-latest.jar
+
+COPY --from=builder /usr/bin/spark-operator /usr/bin/
+RUN apt-get update --allow-releaseinfo-change \
+    && apt-get update \
+    && apt-get install -y openssl curl tini \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /etc/k8s-webhook-server/serving-certs /home/spark && \
-    chmod -R g+rw /etc/k8s-webhook-server/serving-certs && \
-    chown -R spark /etc/k8s-webhook-server/serving-certs /home/spark
-
-USER spark
-
-COPY --from=builder /workspace/bin/spark-operator /usr/bin/spark-operator
+COPY hack/gencerts.sh /usr/bin/
 
 COPY entrypoint.sh /usr/bin/
 
