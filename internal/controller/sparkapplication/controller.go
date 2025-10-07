@@ -408,6 +408,49 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 			app := old.DeepCopy()
 
 			logger.Info("Pending rerun SparkApplication", "name", app.Name, "namespace", app.Namespace, "state", app.Status.AppState.State)
+
+			// Check if driver pod exists and is running. If so, sync the application state.
+			// This handles the case where the operator restarts and finds running pods
+			// with SparkApplications stuck in PENDING_RERUN state.
+			driverPodName := app.Status.DriverInfo.PodName
+			if driverPodName == "" {
+				driverPodName = util.GetDriverPodName(app)
+			}
+
+			driverPod := &corev1.Pod{}
+			err = r.client.Get(ctx, types.NamespacedName{Name: driverPodName, Namespace: app.Namespace}, driverPod)
+			if err == nil {
+				// Driver pod exists - check if it's running or pending
+				if driverPod.Status.Phase == corev1.PodRunning || driverPod.Status.Phase == corev1.PodPending {
+					logger.Info("Driver pod exists and is running/pending, syncing application state",
+						"name", app.Name, "namespace", app.Namespace, "podName", driverPod.Name, "podPhase", driverPod.Status.Phase)
+					// Update the driver info if it wasn't set
+					if app.Status.DriverInfo.PodName == "" {
+						app.Status.DriverInfo.PodName = driverPod.Name
+					}
+					// Preserve the start time and execution attempts from the pod's creation time
+					// since the application is already running
+					if app.Status.LastSubmissionAttemptTime.IsZero() {
+						app.Status.LastSubmissionAttemptTime = driverPod.CreationTimestamp
+					}
+					if app.Status.ExecutionAttempts == 0 {
+						// We don't know the exact number of attempts, but at least 1
+						app.Status.ExecutionAttempts = 1
+					}
+					// Sync the application state to match the actual pod state
+					if err := r.updateSparkApplicationState(ctx, app); err != nil {
+						logger.Error(err, "Failed to sync application state from running pod", "name", app.Name, "namespace", app.Namespace)
+						// Continue with normal flow even if sync fails
+					}
+				} else {
+					logger.Info("Driver pod exists but is not running/pending",
+						"name", app.Name, "namespace", app.Namespace, "podPhase", driverPod.Status.Phase)
+				}
+			} else if !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to get driver pod", "name", driverPodName, "namespace", app.Namespace)
+			}
+
+			// If resources are deleted, proceed with normal resubmission flow
 			if r.validateSparkResourceDeletion(ctx, app) {
 				logger.Info("Successfully deleted resources associated with SparkApplication", "name", app.Name, "namespace", app.Namespace, "state", app.Status.AppState.State)
 				r.recordSparkApplicationEvent(app)
