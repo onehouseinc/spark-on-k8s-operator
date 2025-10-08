@@ -420,8 +420,24 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 			driverPod := &corev1.Pod{}
 			err = r.client.Get(ctx, types.NamespacedName{Name: driverPodName, Namespace: app.Namespace}, driverPod)
 			if err == nil {
-				// Driver pod exists - check if it's running or pending
-				if driverPod.Status.Phase == corev1.PodRunning || driverPod.Status.Phase == corev1.PodPending {
+				// Verify pod ownership before syncing state
+				podAppName := driverPod.Labels[common.LabelSparkAppName]
+				podSubmissionID := driverPod.Labels[common.LabelSubmissionID]
+
+				// Check app name match - this is the primary ownership check
+				if podAppName != app.Name {
+					logger.Info("Driver pod exists but does not belong to this application",
+						"name", app.Name, "namespace", app.Namespace, "podName", driverPod.Name,
+						"podAppName", podAppName, "expectedAppName", app.Name)
+				} else if app.Status.SubmissionID != "" && podSubmissionID != "" && podSubmissionID != app.Status.SubmissionID {
+					// Only check submission ID if BOTH app and pod have one
+					// In PENDING_RERUN state, app.Status.SubmissionID is often empty
+					logger.Info("Driver pod exists but belongs to a different submission",
+						"name", app.Name, "namespace", app.Namespace, "podName", driverPod.Name,
+						"podSubmissionID", podSubmissionID, "expectedSubmissionID", app.Status.SubmissionID)
+				} else if (driverPod.Status.Phase == corev1.PodRunning || driverPod.Status.Phase == corev1.PodPending) && driverPod.DeletionTimestamp == nil {
+					// Driver pod exists and belongs to this app - check if it's running or pending
+					// Also verify it's not being deleted (DeletionTimestamp is nil)
 					logger.Info("Driver pod exists and is running/pending, syncing application state",
 						"name", app.Name, "namespace", app.Namespace, "podName", driverPod.Name, "podPhase", driverPod.Status.Phase)
 					// Update the driver info if it wasn't set
@@ -436,6 +452,10 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 					if app.Status.ExecutionAttempts == 0 {
 						// We don't know the exact number of attempts, but at least 1
 						app.Status.ExecutionAttempts = 1
+					}
+					if app.Status.SubmissionAttempts == 0 {
+						// Also set submission attempts to avoid retry calculation errors
+						app.Status.SubmissionAttempts = 1
 					}
 					// Sync the application state to match the actual pod state
 					if err := r.updateSparkApplicationState(ctx, app); err != nil {
