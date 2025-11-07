@@ -444,6 +444,12 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 					if app.Status.DriverInfo.PodName == "" {
 						app.Status.DriverInfo.PodName = driverPod.Name
 					}
+					// Restore the submission ID for this live attempt
+					// resetSparkApplicationStatus clears this field when entering PENDING_RERUN,
+					// but the driver pod retains it in its label
+					if app.Status.SubmissionID == "" && podSubmissionID != "" {
+						app.Status.SubmissionID = podSubmissionID
+					}
 					// Preserve the start time and execution attempts from the pod's creation time
 					// since the application is already running
 					if app.Status.LastSubmissionAttemptTime.IsZero() {
