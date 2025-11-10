@@ -429,13 +429,10 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 					logger.Info("Driver pod exists but does not belong to this application",
 						"name", app.Name, "namespace", app.Namespace, "podName", driverPod.Name,
 						"podAppName", podAppName, "expectedAppName", app.Name)
-				} else if app.Status.SubmissionID != "" && podSubmissionID != "" && podSubmissionID != app.Status.SubmissionID {
-					// Only check submission ID if BOTH app and pod have one
-					// In PENDING_RERUN state, app.Status.SubmissionID is often empty
-					logger.Info("Driver pod exists but belongs to a different submission",
-						"name", app.Name, "namespace", app.Namespace, "podName", driverPod.Name,
-						"podSubmissionID", podSubmissionID, "expectedSubmissionID", app.Status.SubmissionID)
 				} else if (driverPod.Status.Phase == corev1.PodRunning || driverPod.Status.Phase == corev1.PodPending) && driverPod.DeletionTimestamp == nil {
+					// Don't check submission ID mismatch here - in PENDING_RERUN state, the app's
+					// SubmissionID is stale (from the previous attempt). We want to adopt the
+					// running pod and restore its submission ID to the app status.
 					// Driver pod exists and belongs to this app - check if it's running or pending
 					// Also verify it's not being deleted (DeletionTimestamp is nil)
 					logger.Info("Driver pod exists and is running/pending, syncing application state",
