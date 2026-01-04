@@ -251,6 +251,12 @@ func (r *Reconciler) handleSparkApplicationDeletion(ctx context.Context, req ctr
 
 func (r *Reconciler) reconcileNewSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
+
+	// Track whether we've already attempted submission in this reconciliation.
+	// This prevents the orphaned resource check from running on RetryOnConflict retries
+	// where resources may have been created in a previous iteration of the retry loop.
+	submissionAttempted := false
+
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
@@ -268,11 +274,11 @@ func (r *Reconciler) reconcileNewSparkApplication(ctx context.Context, req ctrl.
 			// updating the status to "Submitted". Without this check, we would attempt submission
 			// again and get HTTP 409 "driver pod already exists" error.
 			//
-			// IMPORTANT: Only clean up resources if SubmissionID is NOT yet set.
-			// If SubmissionID is already set, this is a retry within RetryOnConflict due to status
-			// update failure. Any resources found were created in a previous iteration of this
-			// retry loop, so we should NOT delete them - just proceed with the status update retry.
-			if app.Status.SubmissionID == "" {
+			// IMPORTANT: Only clean up resources if we haven't attempted submission yet in this
+			// reconciliation. If submissionAttempted is true, this is a retry within RetryOnConflict
+			// due to status update failure. Any resources found were created in a previous iteration
+			// of this retry loop, so we should NOT delete them - just proceed with the status update retry.
+			if !submissionAttempted {
 				// First submission attempt - check for any orphaned resources
 				if !r.validateSparkResourceDeletion(ctx, app) {
 					logger.Info("Orphaned Spark resources detected for NEW SparkApplication, initiating cleanup",
@@ -303,15 +309,48 @@ func (r *Reconciler) reconcileNewSparkApplication(ctx context.Context, req ctrl.
 					// to complete the deletion before attempting submission
 					return fmt.Errorf("orphaned resources for SparkApplication name: %s namespace: %s were deleted, requeuing for submission", app.Name, app.Namespace)
 				}
+
+				// Log successful validation before proceeding with submission
+				logger.Info("Submitting NEW SparkApplication (resources validated)",
+					"name", app.Name,
+					"namespace", app.Namespace,
+					"resourcesClean", true)
+
+				_ = r.submitSparkApplication(app)
+				// Mark that submission was attempted. This prevents the orphaned resource check
+				// from running again if the status update fails and RetryOnConflict retries.
+				submissionAttempted = true
+			} else {
+				// This is a retry due to status update conflict. The submission already happened
+				// in a previous iteration of the retry loop, but the status update failed.
+				// We should NOT re-run submitSparkApplication because:
+				// 1. Resources were already created in the previous iteration
+				// 2. Re-running would create duplicate resources
+				// 3. The previous iteration already updated app's status fields in memory
+				//
+				// However, we DO need to re-apply the status changes from the previous submission
+				// to the fresh app object fetched from the API server.
+				logger.Info("Retrying status update for NEW SparkApplication after conflict - skipping re-submission",
+					"name", app.Name,
+					"namespace", app.Namespace)
+
+				// The problem: submitSparkApplication modified the app object in memory in the
+				// previous iteration, but that object is now stale due to the conflict.
+				// The current 'app' object is a fresh copy from the API server.
+				// We cannot re-apply the exact status because we don't have access to the
+				// previously modified object.
+				//
+				// The solution: Since the driver pod was already created with the correct labels
+				// in the previous iteration, we can let the next reconciliation cycle (when the
+				// app is in SUBMITTED state) pick up the driver pod and sync the state correctly.
+				// For now, we should NOT update the status at all to avoid overwriting with stale data.
+				// Just return nil to exit the retry loop successfully.
+				logger.Info("Skipping status update in retry iteration to avoid data loss",
+					"name", app.Name,
+					"namespace", app.Namespace)
+				return nil
 			}
 
-			// Log successful validation before proceeding with submission
-			logger.Info("Submitting NEW SparkApplication (resources validated)",
-				"name", app.Name,
-				"namespace", app.Namespace,
-				"resourcesClean", true)
-
-			_ = r.submitSparkApplication(app)
 			if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
 				return err
 			}
