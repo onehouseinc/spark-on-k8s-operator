@@ -57,6 +57,7 @@ func (h *SparkPodEventHandler) Create(ctx context.Context, event event.CreateEve
 	if !ok {
 		return
 	}
+
 	logger.Info("Spark pod created", "name", pod.Name, "namespace", pod.Namespace, "phase", pod.Status.Phase, "submissionID", pod.Labels[common.LabelSubmissionID])
 	h.enqueueSparkAppForUpdate(ctx, pod, queue)
 
