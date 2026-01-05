@@ -63,7 +63,7 @@ const (
 	ValidatingWebhookName = "spark-operator-webhook"
 
 	PollInterval = 1 * time.Second
-	WaitTimeout  = 5 * time.Minute
+	WaitTimeout  = 10 * time.Minute
 )
 
 var (
