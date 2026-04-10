@@ -153,8 +153,7 @@ go-lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes.
 .PHONY: unit-test
 unit-test: envtest ## Run unit tests.
 	@echo "Running unit tests..."
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)"
-	go test $(shell go list ./... | grep -v /e2e) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $(shell go list ./... | grep -v /e2e) -coverprofile cover.out
 
 .PHONY: e2e-test
 e2e-test: envtest ## Run the e2e tests against a Kind k8s instance that is spun up.
