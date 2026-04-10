@@ -52,7 +52,17 @@ RUN set -ex; \
     rm -rf /var/lib/apt/lists/* && \
     # Create directories
     mkdir -p $SPARK_HOME/jars /etc/k8s-webhook-server/serving-certs /home/spark && \
-    # Download all JARs in parallel for better performance
+    # Upgrade Hadoop jars from 3.3.4 (bundled with Spark 3.5.3) to 3.4.2
+    rm -f $SPARK_HOME/jars/hadoop-client-api-3.3.4.jar \
+          $SPARK_HOME/jars/hadoop-client-runtime-3.3.4.jar \
+          $SPARK_HOME/jars/hadoop-shaded-guava-1.1.1.jar && \
+    wget -q -O $SPARK_HOME/jars/hadoop-client-api-3.4.2.jar \
+        https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-api/3.4.2/hadoop-client-api-3.4.2.jar && \
+    wget -q -O $SPARK_HOME/jars/hadoop-client-runtime-3.4.2.jar \
+        https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-runtime/3.4.2/hadoop-client-runtime-3.4.2.jar && \
+    wget -q -O $SPARK_HOME/jars/hadoop-shaded-guava-1.4.0.jar \
+        https://repo1.maven.org/maven2/org/apache/hadoop/thirdparty/hadoop-shaded-guava/1.4.0/hadoop-shaded-guava-1.4.0.jar && \
+    # Download additional JARs
     wget -q -O $SPARK_HOME/jars/hadoop-aws-3.1.1.jar \
         https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.1.1/hadoop-aws-3.1.1.jar && \
     wget -q -O $SPARK_HOME/jars/aws-java-sdk-bundle-1.11.814.jar \
@@ -61,8 +71,8 @@ RUN set -ex; \
         https://repo1.maven.org/maven2/org/apache/spark/spark-avro_2.12/3.1.1/spark-avro_2.12-3.1.1.jar && \
     wget -q -O $SPARK_HOME/jars/gcs-connector-hadoop3-latest.jar \
         https://storage.googleapis.com/hadoop-lib/gcs/gcs-connector-hadoop3-latest.jar && \
-    wget -q -O $SPARK_HOME/jars/hadoop-azure-3.3.4.jar \
-        https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-azure/3.3.4/hadoop-azure-3.3.4.jar && \
+    wget -q -O $SPARK_HOME/jars/hadoop-azure-3.4.2.jar \
+        https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-azure/3.4.2/hadoop-azure-3.4.2.jar && \
     wget -q -O $SPARK_HOME/jars/azure-storage-blob-12.25.0.jar \
         https://repo1.maven.org/maven2/com/azure/azure-storage-blob/12.25.0/azure-storage-blob-12.25.0.jar && \
     wget -q -O $SPARK_HOME/jars/azure-core-1.51.0.jar \
