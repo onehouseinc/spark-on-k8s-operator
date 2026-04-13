@@ -70,6 +70,9 @@ RUN set -ex; \
         https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.4.2/hadoop-aws-3.4.2.jar && \
     wget -q -O $SPARK_HOME/jars/aws-java-sdk-bundle-1.11.814.jar \
         https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.11.814/aws-java-sdk-bundle-1.11.814.jar && \
+    # AWS SDK v2 bundle required by hadoop-aws 3.4.2 (v1 bundle kept for code still using com.amazonaws.* APIs)
+    wget -q -O $SPARK_HOME/jars/aws-sdk-v2-bundle-2.29.52.jar \
+        https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/2.29.52/bundle-2.29.52.jar && \
     wget -q -O $SPARK_HOME/jars/spark-avro_2.12-3.1.1.jar \
         https://repo1.maven.org/maven2/org/apache/spark/spark-avro_2.12/3.1.1/spark-avro_2.12-3.1.1.jar && \
     wget -q -O $SPARK_HOME/jars/gcs-connector-hadoop3-latest.jar \
