@@ -53,7 +53,7 @@ KUSTOMIZE_VERSION ?= v5.4.1
 CONTROLLER_TOOLS_VERSION ?= v0.15.0
 KIND_VERSION ?= v0.23.0
 KIND_K8S_VERSION ?= v1.29.3
-ENVTEST_VERSION ?= release-0.18
+ENVTEST_VERSION ?= release-0.19
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION ?= 1.29.3
 GOLANGCI_LINT_VERSION ?= v1.61.0
@@ -153,8 +153,7 @@ go-lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes.
 .PHONY: unit-test
 unit-test: envtest ## Run unit tests.
 	@echo "Running unit tests..."
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)"
-	go test $(shell go list ./... | grep -v /e2e) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $(shell go list ./... | grep -v /e2e) -coverprofile cover.out
 
 .PHONY: e2e-test
 e2e-test: envtest ## Run the e2e tests against a Kind k8s instance that is spun up.
