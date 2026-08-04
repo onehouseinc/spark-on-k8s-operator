@@ -57,8 +57,10 @@ RUN set -ex; \
         https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.1.1/hadoop-aws-3.1.1.jar && \
     wget -q -O $SPARK_HOME/jars/aws-java-sdk-bundle-1.11.814.jar \
         https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.11.814/aws-java-sdk-bundle-1.11.814.jar && \
-    wget -q -O $SPARK_HOME/jars/spark-avro_2.12-3.1.1.jar \
-        https://repo1.maven.org/maven2/org/apache/spark/spark-avro_2.12/3.1.1/spark-avro_2.12-3.1.1.jar && \
+    # NOTE (ENG-46085): spark-avro is pinned to 3.5.2 further down, matching the Spark
+    # 3.5.3 runtime in this image and the version jobs actually request. The old 3.1.1
+    # copy is NOT fetched — two spark-avro versions on one classpath is a
+    # ClassCastException waiting to happen, and 3.1.1 never matched this runtime.
     wget -q -O $SPARK_HOME/jars/gcs-connector-hadoop3-latest.jar \
         https://storage.googleapis.com/hadoop-lib/gcs/gcs-connector-hadoop3-latest.jar && \
     wget -q -O $SPARK_HOME/jars/hadoop-azure-3.3.4.jar \
@@ -69,6 +71,33 @@ RUN set -ex; \
         https://repo1.maven.org/maven2/com/azure/azure-core/1.51.0/azure-core-1.51.0.jar && \
     wget -q -O $SPARK_HOME/jars/azure-core-http-netty-1.15.3.jar \
         https://repo1.maven.org/maven2/com/azure/azure-core-http-netty/1.15.3/azure-core-http-netty-1.15.3.jar && \
+    # Structured-streaming Kafka dependency closure (ENG-46085).
+    #
+    # spark-submit runs INSIDE this image, and Ivy resolves --packages into a single
+    # shared cache (default /tmp/.ivy2). Concurrent submits therefore race on the
+    # <artifact>.part -> <artifact> rename and read each other's partial files back as
+    # 0 bytes, failing the submit before any driver pod exists. Baking the closure here
+    # removes the resolution step for these coordinates entirely, so there is nothing
+    # to race on.
+    #
+    # This is the CLOSURE Ivy resolves for
+    # `--packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.2,org.apache.spark:spark-avro_2.12:3.5.2`
+    # MINUS the 8 members Spark 3.5.3's own jars/ already ships at identical versions
+    # (hadoop-client-api/runtime 3.3.4, lz4-java 1.8.0, snappy-java 1.1.10.5,
+    # slf4j-api 2.0.7, commons-logging 1.1.3, jsr305 3.0.0, xz 1.9) — those were being
+    # needlessly re-downloaded on every run and are the artifacts that actually
+    # collided in production. Versions below are pinned to what Spark 3.5.3 resolves;
+    # bump them together with SPARK_TGZ_URL in spark-3.5.3-base/Dockerfile.
+    wget -q -O $SPARK_HOME/jars/spark-sql-kafka-0-10_2.12-3.5.2.jar \
+        https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.2/spark-sql-kafka-0-10_2.12-3.5.2.jar && \
+    wget -q -O $SPARK_HOME/jars/spark-token-provider-kafka-0-10_2.12-3.5.2.jar \
+        https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/3.5.2/spark-token-provider-kafka-0-10_2.12-3.5.2.jar && \
+    wget -q -O $SPARK_HOME/jars/kafka-clients-3.4.1.jar \
+        https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.4.1/kafka-clients-3.4.1.jar && \
+    wget -q -O $SPARK_HOME/jars/commons-pool2-2.11.1.jar \
+        https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar && \
+    wget -q -O $SPARK_HOME/jars/spark-avro_2.12-3.5.2.jar \
+        https://repo1.maven.org/maven2/org/apache/spark/spark-avro_2.12/3.5.2/spark-avro_2.12-3.5.2.jar && \
     # Set permissions for all JARs at once
     chmod 644 $SPARK_HOME/jars/*.jar && \
     # Set directory permissions
