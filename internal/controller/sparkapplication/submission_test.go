@@ -16,6 +16,20 @@ limitations under the License.
 
 package sparkapplication
 
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/kubeflow/spark-operator/api/v1beta2"
+	"github.com/kubeflow/spark-operator/internal/scheduler/yunikorn"
+	"github.com/kubeflow/spark-operator/pkg/common"
+	"github.com/kubeflow/spark-operator/pkg/util"
+)
+
 // import (
 // 	"fmt"
 // 	"os"
@@ -694,3 +708,70 @@ package sparkapplication
 // 		})
 // 	}
 // }
+
+// yunikornAppIDLabel is spelled out rather than imported so the test states the label contract
+// independently of the constant under test.
+const yunikornAppIDLabel = "yunikorn.apache.org/app-id"
+
+// The Yunikorn app-id is rendered statically into .spec.sparkConf by the chart that creates the
+// SparkApplication, and the batch scheduler overrides it per submission. That override only holds
+// because sparkConfOption runs before driverConfOption/executorConfOption in buildSparkSubmitArgs
+// and spark-submit takes the last --conf for a key. [ENG-45235]
+func TestBuildSparkSubmitArgs_YunikornAppIDIsPerSubmission(t *testing.T) {
+	const staticDriverAppID = "spark-code-0bb544d3-20353b38-driver"
+	const staticExecutorAppID = "spark-code-0bb544d3-20353b38-executors"
+
+	// masterOption reads these; in-cluster the operator gets them from the pod environment.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "443")
+
+	app := &v1beta2.SparkApplication{
+		ObjectMeta: metav1.ObjectMeta{Name: "spark-code-0bb544d3-20353b38", Namespace: "default"},
+		Spec: v1beta2.SparkApplicationSpec{
+			Type:         v1beta2.SparkApplicationTypeScala,
+			Mode:         v1beta2.DeployModeCluster,
+			SparkVersion: "3.5.3",
+			Image:        util.StringPtr("spark:3.5.3"),
+			MainClass:    util.StringPtr("org.example.Main"),
+			SparkConf: map[string]string{
+				fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, yunikornAppIDLabel):   staticDriverAppID,
+				fmt.Sprintf(common.SparkKubernetesExecutorLabelTemplate, yunikornAppIDLabel): staticExecutorAppID,
+			},
+			BatchScheduler:        util.StringPtr(yunikorn.SchedulerName),
+			BatchSchedulerOptions: &v1beta2.BatchSchedulerConfiguration{Queue: util.StringPtr("root.default.driver")},
+			Driver:                v1beta2.DriverSpec{SparkPodSpec: v1beta2.SparkPodSpec{Cores: util.Int32Ptr(1), Memory: util.StringPtr("512m")}},
+			Executor:              v1beta2.ExecutorSpec{Instances: util.Int32Ptr(1), SparkPodSpec: v1beta2.SparkPodSpec{Cores: util.Int32Ptr(1), Memory: util.StringPtr("512m")}},
+		},
+		Status: v1beta2.SparkApplicationStatus{SubmissionID: "b0d6f8a1-1c9e-4f6a-9d3e-2f1a5c7b8e40"},
+	}
+
+	scheduler, err := yunikorn.Factory(nil)
+	assert.NoError(t, err)
+	assert.NoError(t, scheduler.Schedule(app))
+
+	args, err := buildSparkSubmitArgs(app)
+	assert.NoError(t, err)
+
+	driverAppID := lastConfValue(args, fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, yunikornAppIDLabel))
+	executorAppID := lastConfValue(args, fmt.Sprintf(common.SparkKubernetesExecutorLabelTemplate, yunikornAppIDLabel))
+
+	assert.Equal(t, staticDriverAppID+"-b0d6f8a1", driverAppID)
+	assert.Equal(t, staticExecutorAppID+"-b0d6f8a1", executorAppID)
+	assert.NotEqual(t, staticDriverAppID, driverAppID)
+	assert.NotEqual(t, staticExecutorAppID, executorAppID)
+}
+
+// lastConfValue returns the value spark-submit would resolve for key: the last --conf wins.
+func lastConfValue(args []string, key string) string {
+	value := ""
+	for i, arg := range args {
+		if arg != "--conf" || i+1 >= len(args) {
+			continue
+		}
+		name, v, found := strings.Cut(args[i+1], "=")
+		if found && name == key {
+			value = v
+		}
+	}
+	return value
+}
