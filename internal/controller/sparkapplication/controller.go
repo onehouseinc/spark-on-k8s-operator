@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -460,7 +461,7 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 			}
 			app := old.DeepCopy()
 
-			logger.Info("Pending rerun SparkApplication", "name", app.Name, "namespace", app.Namespace, "state", app.Status.AppState.State)
+			logger.V(1).Info("Pending rerun SparkApplication", "name", app.Name, "namespace", app.Namespace, "state", app.Status.AppState.State)
 
 			// Check if driver pod exists and is running. If so, sync the application state.
 			// This handles the case where the operator restarts and finds running pods
@@ -478,7 +479,7 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 				podSubmissionID := driverPod.Labels[common.LabelSubmissionID]
 
 				// Log pod and app SubmissionIDs for debugging
-				logger.Info("Found existing driver pod during PENDING_RERUN reconciliation",
+				logger.V(1).Info("Found existing driver pod during PENDING_RERUN reconciliation",
 					"name", app.Name,
 					"namespace", app.Namespace,
 					"podName", driverPod.Name,
@@ -490,7 +491,7 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 
 				// Check app name match - this is the primary ownership check
 				if podAppName != app.Name {
-					logger.Info("Driver pod exists but does not belong to this application",
+					logger.V(1).Info("Driver pod exists but does not belong to this application",
 						"name", app.Name, "namespace", app.Namespace, "podName", driverPod.Name,
 						"podAppName", podAppName, "expectedAppName", app.Name)
 				} else if (driverPod.Status.Phase == corev1.PodRunning || driverPod.Status.Phase == corev1.PodPending) && driverPod.DeletionTimestamp == nil {
@@ -543,7 +544,7 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 						// Continue with normal flow even if sync fails
 					}
 				} else {
-					logger.Info("Driver pod exists but is not running/pending",
+					logger.V(1).Info("Driver pod exists but is not running/pending",
 						"name", app.Name, "namespace", app.Namespace, "podPhase", driverPod.Status.Phase)
 				}
 			} else if !errors.IsNotFound(err) {
@@ -558,6 +559,11 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 				_ = r.submitSparkApplication(app)
 			} else {
 				awaitingDeletion = app.Status.AppState.State == v1beta2.ApplicationStatePendingRerun
+			}
+			// While waiting for deletion the status is usually unchanged; skip the write so each
+			// requeue tick does not issue a no-op update and log it.
+			if equality.Semantic.DeepEqual(old.Status, app.Status) {
+				return nil
 			}
 			if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
 				return err
@@ -1234,7 +1240,7 @@ func (r *Reconciler) validateSparkResourceDeletion(ctx context.Context, app *v1b
 	driverPod := &corev1.Pod{}
 	if err := r.client.Get(ctx, types.NamespacedName{Name: driverPodName, Namespace: app.Namespace}, driverPod); err == nil {
 		// Orphaned driver pod found - log details for debugging
-		logger.Info("Orphaned driver pod found during validation",
+		logger.V(1).Info("Orphaned driver pod found during validation",
 			"name", app.Name,
 			"namespace", app.Namespace,
 			"podName", driverPodName,
@@ -1256,7 +1262,7 @@ func (r *Reconciler) validateSparkResourceDeletion(ctx context.Context, app *v1b
 	if sparkUIServiceName != "" {
 		if err := r.client.Get(ctx, types.NamespacedName{Name: sparkUIServiceName, Namespace: app.Namespace}, &corev1.Service{}); err == nil {
 			// Orphaned service found - log for debugging
-			logger.Info("Orphaned web UI service found during validation",
+			logger.V(1).Info("Orphaned web UI service found during validation",
 				"name", app.Name,
 				"namespace", app.Namespace,
 				"serviceName", sparkUIServiceName)
@@ -1275,7 +1281,7 @@ func (r *Reconciler) validateSparkResourceDeletion(ctx context.Context, app *v1b
 	if sparkUIIngressName != "" {
 		if err := r.client.Get(ctx, types.NamespacedName{Name: sparkUIIngressName, Namespace: app.Namespace}, &networkingv1.Ingress{}); err == nil {
 			// Orphaned ingress found - log for debugging
-			logger.Info("Orphaned web UI ingress found during validation",
+			logger.V(1).Info("Orphaned web UI ingress found during validation",
 				"name", app.Name,
 				"namespace", app.Namespace,
 				"ingressName", sparkUIIngressName)
