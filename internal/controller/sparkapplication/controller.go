@@ -55,6 +55,10 @@ var (
 	logger = log.Log.WithName("")
 )
 
+// The driver pod's delete event can be dropped on a SubmissionID mismatch, so PENDING_RERUN
+// must poll for deletion itself rather than wait for that event. [ENG-51503]
+const pendingRerunRequeueInterval = 5 * time.Second
+
 // Options defines the options of the controller.
 type Options struct {
 	Namespaces            []string
@@ -443,9 +447,11 @@ func (r *Reconciler) reconcileRunningSparkApplication(ctx context.Context, req c
 
 func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
+	awaitingDeletion := false
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
+			awaitingDeletion = false
 			old, err := r.getSparkApplication(key)
 			if err != nil {
 				return err
@@ -551,6 +557,8 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 				r.recordSparkApplicationEvent(app)
 				r.resetSparkApplicationStatus(app)
 				_ = r.submitSparkApplication(app)
+			} else if app.Status.AppState.State == v1beta2.ApplicationStatePendingRerun {
+				awaitingDeletion = true
 			}
 			if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
 				return err
@@ -561,6 +569,11 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 	if retryErr != nil {
 		logger.Error(retryErr, "Failed to reconcile SparkApplication", "name", key.Name, "namespace", key.Namespace)
 		return ctrl.Result{}, retryErr
+	}
+	if awaitingDeletion {
+		logger.Info("Spark resources not yet deleted, requeueing PENDING_RERUN SparkApplication",
+			"name", key.Name, "namespace", key.Namespace, "requeueAfter", pendingRerunRequeueInterval)
+		return ctrl.Result{RequeueAfter: pendingRerunRequeueInterval}, nil
 	}
 	return ctrl.Result{}, nil
 }

@@ -950,6 +950,7 @@ var _ = Describe("SparkApplication Controller", func() {
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.Requeue).To(BeFalse())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0), "should requeue until the old driver pod is gone")
 
 			By("Verifying that start time and attempts were NOT preserved from the deleting pod")
 			app := &v1beta2.SparkApplication{}
@@ -959,6 +960,38 @@ var _ = Describe("SparkApplication Controller", func() {
 			Expect(app.Status.LastSubmissionAttemptTime.IsZero()).To(BeTrue(), "LastSubmissionAttemptTime should remain empty when pod is being deleted")
 			Expect(app.Status.ExecutionAttempts).To(Equal(int32(0)), "ExecutionAttempts should remain 0 when pod is being deleted")
 			Expect(app.Status.SubmissionAttempts).To(Equal(int32(0)), "SubmissionAttempts should remain 0 when pod is being deleted")
+		})
+
+		It("Should resubmit on requeue once the old driver pod is gone, without a pod event", func() {
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				record.NewFakeRecorder(3),
+				nil,
+				sparkapplication.Options{Namespaces: []string{appNamespace}},
+			)
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+
+			By("Letting the old driver pod finish deleting")
+			driverPod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, getDriverNamespacedName(appName, appNamespace), driverPod)).To(Succeed())
+			driverPod.Finalizers = []string{}
+			Expect(k8sClient.Update(ctx, driverPod)).To(Succeed())
+			Eventually(func() bool {
+				return errors.IsNotFound(k8sClient.Get(ctx, getDriverNamespacedName(appName, appNamespace), &corev1.Pod{}))
+			}).Should(BeTrue())
+
+			By("Reconciling again, as the requeue would")
+			result, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeZero())
+
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			Expect(app.Status.AppState.State).NotTo(Equal(v1beta2.ApplicationStatePendingRerun))
 		})
 	})
 })
