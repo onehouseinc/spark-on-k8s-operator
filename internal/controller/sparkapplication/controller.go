@@ -500,24 +500,16 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 					if app.Status.DriverInfo.PodName == "" {
 						app.Status.DriverInfo.PodName = driverPod.Name
 					}
-					// Restore the submission ID for this live attempt
-					// resetSparkApplicationStatus clears this field when entering PENDING_RERUN,
-					// but the driver pod retains it in its label
-					if app.Status.SubmissionID == "" && podSubmissionID != "" {
+					// Adopt the live driver's submission ID. The app's may be empty or stale, e.g. when the
+					// operator died after spark-submit but before persisting the new ID; keeping a stale ID
+					// makes enqueueSparkAppForUpdate drop every event from this attempt's pods. [ENG-51503]
+					if podSubmissionID != "" && app.Status.SubmissionID != podSubmissionID {
 						logger.Info("Restoring SubmissionID from driver pod label",
 							"name", app.Name,
 							"namespace", app.Namespace,
 							"podSubmissionID", podSubmissionID,
 							"appSubmissionID", app.Status.SubmissionID)
 						app.Status.SubmissionID = podSubmissionID
-					} else if app.Status.SubmissionID != "" && podSubmissionID != "" && app.Status.SubmissionID != podSubmissionID {
-						// Log mismatch detection - this indicates a bug
-						logger.Error(nil, "SubmissionID MISMATCH detected - pod updates may be ignored!",
-							"name", app.Name,
-							"namespace", app.Namespace,
-							"appSubmissionID", app.Status.SubmissionID,
-							"podSubmissionID", podSubmissionID,
-							"action", "NOT_RESTORING")
 					}
 					// Preserve the start time and execution attempts from the pod's creation time
 					// since the application is already running
