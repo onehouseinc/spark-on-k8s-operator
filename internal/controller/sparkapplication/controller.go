@@ -56,8 +56,11 @@ var (
 )
 
 // The driver pod's delete event can be dropped on a SubmissionID mismatch, so PENDING_RERUN
-// must poll for deletion itself rather than wait for that event. [ENG-51503]
-const pendingRerunRequeueInterval = 5 * time.Second
+// polls for the old driver's deletion for a bounded window instead of relying on it. [ENG-51503]
+const (
+	pendingRerunRequeueInterval = 5 * time.Second
+	pendingRerunRequeueWindow   = 1 * time.Minute
+)
 
 // Options defines the options of the controller.
 type Options struct {
@@ -452,6 +455,7 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 		retry.DefaultRetry,
 		func() error {
 			awaitingDeletion = false
+			var existingDriverPod *corev1.Pod
 			old, err := r.getSparkApplication(key)
 			if err != nil {
 				return err
@@ -474,6 +478,7 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 			driverPod := &corev1.Pod{}
 			err = r.client.Get(ctx, types.NamespacedName{Name: driverPodName, Namespace: app.Namespace}, driverPod)
 			if err == nil {
+				existingDriverPod = driverPod
 				// Verify pod ownership before syncing state
 				podAppName := driverPod.Labels[common.LabelSparkAppName]
 				podSubmissionID := driverPod.Labels[common.LabelSubmissionID]
@@ -558,7 +563,7 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 				r.resetSparkApplicationStatus(app)
 				_ = r.submitSparkApplication(app)
 			} else if app.Status.AppState.State == v1beta2.ApplicationStatePendingRerun {
-				awaitingDeletion = true
+				awaitingDeletion = withinPendingRerunRequeueWindow(existingDriverPod, time.Now())
 			}
 			if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
 				return err
@@ -1221,6 +1226,20 @@ func (r *Reconciler) deleteWebUIIngress(ctx context.Context, app *v1beta2.SparkA
 	}
 
 	return nil
+}
+
+// withinPendingRerunRequeueWindow reports whether the driver pod's deletion was requested less than
+// pendingRerunRequeueWindow ago. DeletionTimestamp is the grace-period deadline, so the grace period
+// is subtracted to get the request time.
+func withinPendingRerunRequeueWindow(driverPod *corev1.Pod, now time.Time) bool {
+	if driverPod == nil || driverPod.DeletionTimestamp == nil {
+		return false
+	}
+	requested := driverPod.DeletionTimestamp.Time
+	if driverPod.DeletionGracePeriodSeconds != nil {
+		requested = requested.Add(-time.Duration(*driverPod.DeletionGracePeriodSeconds) * time.Second)
+	}
+	return now.Sub(requested) < pendingRerunRequeueWindow
 }
 
 // Validate that any Spark resources (driver/Service/Ingress) created for the application have been deleted.
