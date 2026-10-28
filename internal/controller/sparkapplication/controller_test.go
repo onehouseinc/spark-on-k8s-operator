@@ -27,8 +27,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/kubeflow/spark-operator/api/v1beta2"
@@ -959,6 +963,74 @@ var _ = Describe("SparkApplication Controller", func() {
 			Expect(app.Status.LastSubmissionAttemptTime.IsZero()).To(BeTrue(), "LastSubmissionAttemptTime should remain empty when pod is being deleted")
 			Expect(app.Status.ExecutionAttempts).To(Equal(int32(0)), "ExecutionAttempts should remain 0 when pod is being deleted")
 			Expect(app.Status.SubmissionAttempts).To(Equal(int32(0)), "SubmissionAttempts should remain 0 when pod is being deleted")
+		})
+	})
+
+	Context("When the status write after a pending rerun resubmission conflicts", func() {
+		ctx := context.Background()
+		appName := "test-pending-rerun-submit-conflict"
+		appNamespace := "default"
+		key := types.NamespacedName{
+			Name:      appName,
+			Namespace: appNamespace,
+		}
+
+		BeforeEach(func() {
+			app := &v1beta2.SparkApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      appName,
+					Namespace: appNamespace,
+				},
+				Spec: v1beta2.SparkApplicationSpec{
+					MainApplicationFile: util.StringPtr("local:///dummy.jar"),
+				},
+			}
+			v1beta2.SetSparkApplicationDefaults(app)
+			Expect(k8sClient.Create(ctx, app)).To(Succeed())
+
+			app.Status.AppState.State = v1beta2.ApplicationStatePendingRerun
+			app.Status.SubmissionID = "previous-submission-id"
+			Expect(k8sClient.Status().Update(ctx, app)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, app)).To(Succeed())
+		})
+
+		It("Should retry only the status write, not the submission", func() {
+			base, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme.Scheme})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Fail the first status write with a conflict and remember the submission it carried.
+			firstSubmissionID := ""
+			conflicting := interceptor.NewClient(base, interceptor.Funcs{
+				SubResourceUpdate: func(ctx context.Context, c client.Client, subResource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+					if app, ok := obj.(*v1beta2.SparkApplication); ok && firstSubmissionID == "" {
+						firstSubmissionID = app.Status.SubmissionID
+						return errors.NewConflict(schema.GroupResource{Group: "sparkoperator.k8s.io", Resource: "sparkapplications"}, app.Name, fmt.Errorf("injected conflict"))
+					}
+					return c.SubResource(subResource).Update(ctx, obj, opts...)
+				},
+			})
+
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				conflicting,
+				record.NewFakeRecorder(10),
+				nil,
+				sparkapplication.Options{Namespaces: []string{appNamespace}},
+			)
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			Expect(firstSubmissionID).NotTo(BeEmpty())
+			Expect(firstSubmissionID).NotTo(Equal("previous-submission-id"))
+			Expect(app.Status.SubmissionID).To(Equal(firstSubmissionID))
 		})
 	})
 })
