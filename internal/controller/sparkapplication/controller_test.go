@@ -790,6 +790,12 @@ var _ = Describe("SparkApplication Controller", func() {
 			// and needs to be cleaned up before resubmission
 			Expect(app.Status.LastSubmissionAttemptTime.IsZero()).To(BeTrue())
 			Expect(app.Status.ExecutionAttempts).To(Equal(int32(0)))
+
+			// Nothing else deletes this pod, so the rerun must request it and keep checking.
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			driverPod := &corev1.Pod{}
+			err = k8sClient.Get(ctx, getDriverNamespacedName(appName, appNamespace), driverPod)
+			Expect(errors.IsNotFound(err) || (err == nil && driverPod.DeletionTimestamp != nil)).To(BeTrue())
 		})
 	})
 
@@ -872,6 +878,9 @@ var _ = Describe("SparkApplication Controller", func() {
 
 			// Should remain in pending rerun state
 			Expect(app.Status.AppState.State).To(Equal(v1beta2.ApplicationStatePendingRerun))
+
+			// Another app's pod is never deleted (AfterEach finds it); it is rechecked slowly instead.
+			Expect(result.RequeueAfter).To(Equal(time.Minute))
 		})
 	})
 
@@ -950,6 +959,7 @@ var _ = Describe("SparkApplication Controller", func() {
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.Requeue).To(BeFalse())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0), "should requeue until the old driver pod is gone")
 
 			By("Verifying that start time and attempts were NOT preserved from the deleting pod")
 			app := &v1beta2.SparkApplication{}
@@ -959,6 +969,108 @@ var _ = Describe("SparkApplication Controller", func() {
 			Expect(app.Status.LastSubmissionAttemptTime.IsZero()).To(BeTrue(), "LastSubmissionAttemptTime should remain empty when pod is being deleted")
 			Expect(app.Status.ExecutionAttempts).To(Equal(int32(0)), "ExecutionAttempts should remain 0 when pod is being deleted")
 			Expect(app.Status.SubmissionAttempts).To(Equal(int32(0)), "SubmissionAttempts should remain 0 when pod is being deleted")
+		})
+
+		It("Should resubmit on requeue once the old driver pod is gone, without a pod event", func() {
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				record.NewFakeRecorder(3),
+				nil,
+				sparkapplication.Options{Namespaces: []string{appNamespace}},
+			)
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+
+			By("Letting the old driver pod finish deleting")
+			driverPod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, getDriverNamespacedName(appName, appNamespace), driverPod)).To(Succeed())
+			driverPod.Finalizers = []string{}
+			Expect(k8sClient.Update(ctx, driverPod)).To(Succeed())
+			Eventually(func() bool {
+				return errors.IsNotFound(k8sClient.Get(ctx, getDriverNamespacedName(appName, appNamespace), &corev1.Pod{}))
+			}).Should(BeTrue())
+
+			By("Reconciling again, as the requeue would")
+			result, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeZero())
+
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			Expect(app.Status.SubmissionAttempts).To(Equal(int32(1)), "a new submission should have been attempted")
+			Expect(app.Status.SubmissionID).NotTo(BeEmpty())
+			Expect(app.Status.AppState.State).NotTo(Equal(v1beta2.ApplicationStatePendingRerun))
+		})
+	})
+
+	Context("When reconciling a pending rerun SparkApplication whose web UI service is not yet deleted", func() {
+		ctx := context.Background()
+		appName := "test-pending-rerun-lingering-service"
+		appNamespace := "default"
+		serviceName := appName + "-ui-svc"
+		key := types.NamespacedName{
+			Name:      appName,
+			Namespace: appNamespace,
+		}
+
+		BeforeEach(func() {
+			app := &v1beta2.SparkApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      appName,
+					Namespace: appNamespace,
+				},
+				Spec: v1beta2.SparkApplicationSpec{
+					MainApplicationFile: util.StringPtr("local:///dummy.jar"),
+				},
+			}
+			v1beta2.SetSparkApplicationDefaults(app)
+			Expect(k8sClient.Create(ctx, app)).To(Succeed())
+
+			service := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      serviceName,
+					Namespace: appNamespace,
+				},
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{{Port: 4040}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, service)).To(Succeed())
+
+			// No driver pod, so nothing the controller watches will change again.
+			app.Status.AppState.State = v1beta2.ApplicationStatePendingRerun
+			app.Status.DriverInfo.WebUIServiceName = serviceName
+			Expect(k8sClient.Status().Update(ctx, app)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, app)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: appNamespace},
+			})).To(Succeed())
+		})
+
+		It("Should requeue instead of waiting for an event", func() {
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				record.NewFakeRecorder(3),
+				nil,
+				sparkapplication.Options{Namespaces: []string{appNamespace}},
+			)
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			Expect(app.Status.AppState.State).To(Equal(v1beta2.ApplicationStatePendingRerun))
 		})
 	})
 })

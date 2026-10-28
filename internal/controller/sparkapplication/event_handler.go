@@ -58,7 +58,7 @@ func (h *SparkPodEventHandler) Create(ctx context.Context, event event.CreateEve
 		return
 	}
 	logger.Info("Spark pod created", "name", pod.Name, "namespace", pod.Namespace, "phase", pod.Status.Phase, "submissionID", pod.Labels[common.LabelSubmissionID])
-	h.enqueueSparkAppForUpdate(ctx, pod, queue)
+	h.enqueueSparkAppForUpdate(ctx, pod, queue, false)
 
 	if h.metrics != nil && util.IsExecutorPod(pod) {
 		h.metrics.HandleSparkExecutorCreate(pod)
@@ -82,7 +82,7 @@ func (h *SparkPodEventHandler) Update(ctx context.Context, event event.UpdateEve
 	}
 
 	logger.Info("Spark pod updated", "name", newPod.Name, "namespace", newPod.Namespace, "oldPhase", oldPod.Status.Phase, "newPhase", newPod.Status.Phase, "submissionID", newPod.Labels[common.LabelSubmissionID])
-	h.enqueueSparkAppForUpdate(ctx, newPod, queue)
+	h.enqueueSparkAppForUpdate(ctx, newPod, queue, false)
 
 	if h.metrics != nil && util.IsExecutorPod(oldPod) && util.IsExecutorPod(newPod) {
 		h.metrics.HandleSparkExecutorUpdate(oldPod, newPod)
@@ -97,7 +97,7 @@ func (h *SparkPodEventHandler) Delete(ctx context.Context, event event.DeleteEve
 	}
 
 	logger.Info("Spark pod deleted", "name", pod.Name, "namespace", pod.Namespace, "phase", pod.Status.Phase)
-	h.enqueueSparkAppForUpdate(ctx, pod, queue)
+	h.enqueueSparkAppForUpdate(ctx, pod, queue, util.IsDriverPod(pod))
 
 	if h.metrics != nil && util.IsExecutorPod(pod) {
 		h.metrics.HandleSparkExecutorDelete(pod)
@@ -112,10 +112,13 @@ func (h *SparkPodEventHandler) Generic(ctx context.Context, event event.GenericE
 	}
 
 	logger.Info("Spark pod generic event ", "name", pod.Name, "namespace", pod.Namespace, "phase", pod.Status.Phase)
-	h.enqueueSparkAppForUpdate(ctx, pod, queue)
+	h.enqueueSparkAppForUpdate(ctx, pod, queue, false)
 }
 
-func (h *SparkPodEventHandler) enqueueSparkAppForUpdate(ctx context.Context, pod *corev1.Pod, queue workqueue.RateLimitingInterface) {
+// enqueueSparkAppForUpdate enqueues the pod's SparkApplication. Events from another submission are dropped
+// unless ignoreSubmissionID is set: a driver's deletion is what a PENDING_RERUN app is waiting for, and
+// reconciling reads current state, so an extra reconcile is harmless.
+func (h *SparkPodEventHandler) enqueueSparkAppForUpdate(ctx context.Context, pod *corev1.Pod, queue workqueue.RateLimitingInterface, ignoreSubmissionID bool) {
 	name := util.GetAppName(pod)
 	if name == "" {
 		return
@@ -135,7 +138,7 @@ func (h *SparkPodEventHandler) enqueueSparkAppForUpdate(ctx context.Context, pod
 				"appName", name)
 			return
 		}
-		if app.Status.SubmissionID != submissionID {
+		if app.Status.SubmissionID != submissionID && !ignoreSubmissionID {
 			logger.Info("Pod event FILTERED OUT due to SubmissionID mismatch - reconciliation NOT triggered",
 				"podName", pod.Name,
 				"podNamespace", pod.Namespace,
@@ -147,11 +150,12 @@ func (h *SparkPodEventHandler) enqueueSparkAppForUpdate(ctx context.Context, pod
 				"reason", "SubmissionID_mismatch")
 			return
 		}
-		logger.Info("Pod event ACCEPTED - SubmissionIDs match, triggering reconciliation",
+		logger.Info("Pod event ACCEPTED, triggering reconciliation",
 			"podName", pod.Name,
 			"podNamespace", pod.Namespace,
 			"podPhase", pod.Status.Phase,
 			"submissionID", submissionID,
+			"submissionIDsMatch", app.Status.SubmissionID == submissionID,
 			"appName", app.Name,
 			"appState", app.Status.AppState.State)
 	}
