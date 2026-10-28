@@ -443,6 +443,10 @@ func (r *Reconciler) reconcileRunningSparkApplication(ctx context.Context, req c
 
 func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
+	// Set once spark-submit has run, so a conflict on the status write retries only the write.
+	// Rerunning the whole closure would submit again: the cache still shows PENDING_RERUN and may
+	// not have the new driver pod yet.
+	var submittedStatus *v1beta2.SparkApplicationStatus
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
@@ -454,6 +458,10 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 				return nil
 			}
 			app := old.DeepCopy()
+			if submittedStatus != nil {
+				app.Status = *submittedStatus
+				return r.updateSparkApplicationStatus(ctx, app)
+			}
 
 			logger.Info("Pending rerun SparkApplication", "name", app.Name, "namespace", app.Namespace, "state", app.Status.AppState.State)
 
@@ -551,6 +559,7 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 				r.recordSparkApplicationEvent(app)
 				r.resetSparkApplicationStatus(app)
 				_ = r.submitSparkApplication(app)
+				submittedStatus = app.Status.DeepCopy()
 			}
 			if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
 				return err
