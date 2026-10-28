@@ -665,9 +665,13 @@ var _ = Describe("SparkApplication Controller", func() {
 				driverPod.Status.Phase = corev1.PodPending
 				Expect(k8sClient.Status().Update(ctx, driverPod)).To(Succeed())
 
+				// Counters as the previous attempt left them: FAILING -> PENDING_RERUN does not reset them.
 				app.Status.AppState.State = v1beta2.ApplicationStatePendingRerun
 				app.Status.DriverInfo.PodName = driverPod.Name
 				app.Status.SubmissionID = "stale-submission-id"
+				app.Status.SubmissionAttempts = 2
+				app.Status.ExecutionAttempts = 2
+				app.Status.LastSubmissionAttemptTime = metav1.NewTime(time.Now().Add(-time.Hour))
 				Expect(k8sClient.Status().Update(ctx, app)).To(Succeed())
 			}
 		})
@@ -698,6 +702,13 @@ var _ = Describe("SparkApplication Controller", func() {
 			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
 			Expect(app.Status.SubmissionID).To(Equal("live-submission-id"))
 			Expect(app.Status.AppState.State).NotTo(Equal(v1beta2.ApplicationStatePendingRerun))
+
+			driverPod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, getDriverNamespacedName(appName, appNamespace), driverPod)).To(Succeed())
+			Expect(app.Status.SubmissionAttempts).To(Equal(int32(1)))
+			Expect(app.Status.ExecutionAttempts).To(Equal(int32(3)))
+			Expect(app.Status.LastSubmissionAttemptTime.Time).To(BeTemporally("==", driverPod.CreationTimestamp.Time))
+			Expect(app.Status.DriverInfo.PodName).To(Equal(driverPod.Name))
 		})
 	})
 
