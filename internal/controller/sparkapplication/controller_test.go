@@ -790,6 +790,12 @@ var _ = Describe("SparkApplication Controller", func() {
 			// and needs to be cleaned up before resubmission
 			Expect(app.Status.LastSubmissionAttemptTime.IsZero()).To(BeTrue())
 			Expect(app.Status.ExecutionAttempts).To(Equal(int32(0)))
+
+			// Nothing else deletes this pod, so the rerun must request it and keep checking.
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			driverPod := &corev1.Pod{}
+			err = k8sClient.Get(ctx, getDriverNamespacedName(appName, appNamespace), driverPod)
+			Expect(errors.IsNotFound(err) || (err == nil && driverPod.DeletionTimestamp != nil)).To(BeTrue())
 		})
 	})
 
@@ -872,6 +878,9 @@ var _ = Describe("SparkApplication Controller", func() {
 
 			// Should remain in pending rerun state
 			Expect(app.Status.AppState.State).To(Equal(v1beta2.ApplicationStatePendingRerun))
+
+			// Another app's pod is never deleted (AfterEach finds it); it is rechecked slowly instead.
+			Expect(result.RequeueAfter).To(Equal(time.Minute))
 		})
 	})
 

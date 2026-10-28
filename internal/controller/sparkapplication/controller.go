@@ -59,6 +59,10 @@ var (
 // Services and Ingresses are not watched, so PENDING_RERUN polls until they are gone too.
 const pendingRerunRequeueInterval = 5 * time.Second
 
+// A driver pod name held by another application is never deleted by this one, so PENDING_RERUN
+// rechecks it slowly and logs each check at Info rather than polling silently.
+const foreignDriverPodRequeueInterval = time.Minute
+
 // Options defines the options of the controller.
 type Options struct {
 	Namespaces            []string
@@ -448,10 +452,13 @@ func (r *Reconciler) reconcileRunningSparkApplication(ctx context.Context, req c
 func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
 	awaitingDeletion := false
+	foreignDriverPod := false
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
 			awaitingDeletion = false
+			foreignDriverPod = false
+			leftoverDriverPod := false
 			old, err := r.getSparkApplication(key)
 			if err != nil {
 				return err
@@ -491,7 +498,8 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 
 				// Check app name match - this is the primary ownership check
 				if podAppName != app.Name {
-					logger.V(1).Info("Driver pod exists but does not belong to this application",
+					foreignDriverPod = true
+					logger.Info("Driver pod exists but does not belong to this application, waiting for it to be removed",
 						"name", app.Name, "namespace", app.Namespace, "podName", driverPod.Name,
 						"podAppName", podAppName, "expectedAppName", app.Name)
 				} else if (driverPod.Status.Phase == corev1.PodRunning || driverPod.Status.Phase == corev1.PodPending) && driverPod.DeletionTimestamp == nil {
@@ -546,6 +554,7 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 				} else {
 					logger.V(1).Info("Driver pod exists but is not running/pending",
 						"name", app.Name, "namespace", app.Namespace, "podPhase", driverPod.Status.Phase)
+					leftoverDriverPod = driverPod.DeletionTimestamp == nil
 				}
 			} else if !errors.IsNotFound(err) {
 				logger.Error(err, "Failed to get driver pod", "name", driverPodName, "namespace", app.Namespace)
@@ -559,6 +568,15 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 				_ = r.submitSparkApplication(app)
 			} else {
 				awaitingDeletion = app.Status.AppState.State == v1beta2.ApplicationStatePendingRerun
+				// Nothing else deletes a driver that ended before this rerun reconciled (e.g. the operator
+				// restarted mid-resubmit), so ask for it here; waiting alone would never end.
+				if awaitingDeletion && leftoverDriverPod {
+					logger.Info("Deleting leftover driver pod before resubmitting",
+						"name", app.Name, "namespace", app.Namespace, "podName", driverPodName)
+					if err := r.deleteSparkResources(ctx, app); err != nil {
+						logger.Error(err, "Failed to delete resources associated with SparkApplication", "name", app.Name, "namespace", app.Namespace)
+					}
+				}
 			}
 			// While waiting for deletion the status is usually unchanged; skip the write so each
 			// requeue tick does not issue a no-op update and log it.
@@ -574,6 +592,9 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 	if retryErr != nil {
 		logger.Error(retryErr, "Failed to reconcile SparkApplication", "name", key.Name, "namespace", key.Namespace)
 		return ctrl.Result{}, retryErr
+	}
+	if awaitingDeletion && foreignDriverPod {
+		return ctrl.Result{RequeueAfter: foreignDriverPodRequeueInterval}, nil
 	}
 	if awaitingDeletion {
 		logger.V(1).Info("Spark resources not yet deleted, requeueing PENDING_RERUN SparkApplication",
