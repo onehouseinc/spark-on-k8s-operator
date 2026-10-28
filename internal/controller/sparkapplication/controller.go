@@ -28,10 +28,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -54,6 +56,15 @@ import (
 var (
 	logger = log.Log.WithName("")
 )
+
+// statusUpdateTimeout bounds a status save. Saves ignore reconcile cancellation (see
+// updateSparkApplicationStatus), so only this timeout stops a save against a hung API server.
+const statusUpdateTimeout = 10 * time.Second
+
+// pendingRerunRequeueInterval sets how often a PENDING_RERUN app checks whether its old driver,
+// Service, and Ingress are gone. Their deletion events can be filtered out or never sent, so the
+// app polls instead of waiting.
+const pendingRerunRequeueInterval = 5 * time.Second
 
 // Options defines the options of the controller.
 type Options struct {
@@ -443,9 +454,12 @@ func (r *Reconciler) reconcileRunningSparkApplication(ctx context.Context, req c
 
 func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
+	awaitingDeletion := false
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
+			awaitingDeletion = false
+			foreignDriver := false
 			old, err := r.getSparkApplication(key)
 			if err != nil {
 				return err
@@ -483,41 +497,33 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 					"appSubmissionID", app.Status.SubmissionID,
 					"submissionIDsMatch", podSubmissionID == app.Status.SubmissionID)
 
-				// Check app name match - this is the primary ownership check
-				if podAppName != app.Name {
+				isLive := driverPod.Status.Phase == corev1.PodRunning || driverPod.Status.Phase == corev1.PodPending
+				// A new driver can only be created once the old one is gone, so a driver whose ID
+				// differs from the app's comes from a newer submission whose status save was lost,
+				// even if that driver has already finished.
+				fromUnsavedSubmission := podSubmissionID != "" && podSubmissionID != app.Status.SubmissionID
+
+				// Check ownership before syncing state from this pod
+				if !isAppDriver(app, driverPod) {
+					foreignDriver = true
 					logger.Info("Driver pod exists but does not belong to this application",
 						"name", app.Name, "namespace", app.Namespace, "podName", driverPod.Name,
 						"podAppName", podAppName, "expectedAppName", app.Name)
-				} else if (driverPod.Status.Phase == corev1.PodRunning || driverPod.Status.Phase == corev1.PodPending) && driverPod.DeletionTimestamp == nil {
-					// Don't check submission ID mismatch here - in PENDING_RERUN state, the app's
-					// SubmissionID is stale (from the previous attempt). We want to adopt the
-					// running pod and restore its submission ID to the app status.
-					// Driver pod exists and belongs to this app - check if it's running or pending
-					// Also verify it's not being deleted (DeletionTimestamp is nil)
-					logger.Info("Driver pod exists and is running/pending, syncing application state",
+				} else if (isLive || fromUnsavedSubmission) && driverPod.DeletionTimestamp == nil {
+					// The driver belongs to the current submission: adopt it and sync the application
+					// state from it instead of resubmitting. This handles an operator restart that
+					// lands between spark-submit and the status save.
+					logger.Info("Driver pod belongs to the current submission, syncing application state",
 						"name", app.Name, "namespace", app.Namespace, "podName", driverPod.Name, "podPhase", driverPod.Status.Phase)
+					if replacedStaleID := adoptDriverSubmissionID(app, driverPod); replacedStaleID {
+						// The status still describes the previous run. Reset it and count this
+						// submission, as the lost save would have.
+						r.resetSparkApplicationStatus(app)
+						app.Status.ExecutionAttempts++
+					}
 					// Update the driver info if it wasn't set
 					if app.Status.DriverInfo.PodName == "" {
 						app.Status.DriverInfo.PodName = driverPod.Name
-					}
-					// Restore the submission ID for this live attempt
-					// resetSparkApplicationStatus clears this field when entering PENDING_RERUN,
-					// but the driver pod retains it in its label
-					if app.Status.SubmissionID == "" && podSubmissionID != "" {
-						logger.Info("Restoring SubmissionID from driver pod label",
-							"name", app.Name,
-							"namespace", app.Namespace,
-							"podSubmissionID", podSubmissionID,
-							"appSubmissionID", app.Status.SubmissionID)
-						app.Status.SubmissionID = podSubmissionID
-					} else if app.Status.SubmissionID != "" && podSubmissionID != "" && app.Status.SubmissionID != podSubmissionID {
-						// Log mismatch detection - this indicates a bug
-						logger.Error(nil, "SubmissionID MISMATCH detected - pod updates may be ignored!",
-							"name", app.Name,
-							"namespace", app.Namespace,
-							"appSubmissionID", app.Status.SubmissionID,
-							"podSubmissionID", podSubmissionID,
-							"action", "NOT_RESTORING")
 					}
 					// Preserve the start time and execution attempts from the pod's creation time
 					// since the application is already running
@@ -551,6 +557,20 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 				r.recordSparkApplicationEvent(app)
 				r.resetSparkApplicationStatus(app)
 				_ = r.submitSparkApplication(app)
+			} else if app.Status.AppState.State == v1beta2.ApplicationStatePendingRerun {
+				awaitingDeletion = true
+				// Delete again on every check: deletes are idempotent, and this removes leftovers
+				// that nothing else deletes, such as a finished driver or a Service whose earlier
+				// delete failed. A driver owned by another application is never touched.
+				if !foreignDriver {
+					if err := r.deleteSparkResources(ctx, app); err != nil {
+						logger.Error(err, "Failed to delete resources associated with SparkApplication", "name", app.Name, "namespace", app.Namespace)
+					}
+				}
+			}
+			// While waiting, the status rarely changes; skip the no-op save.
+			if equality.Semantic.DeepEqual(old.Status, app.Status) {
+				return nil
 			}
 			if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
 				return err
@@ -561,6 +581,14 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 	if retryErr != nil {
 		logger.Error(retryErr, "Failed to reconcile SparkApplication", "name", key.Name, "namespace", key.Namespace)
 		return ctrl.Result{}, retryErr
+	}
+	if awaitingDeletion {
+		// Jitter spreads out apps that entered PENDING_RERUN together, e.g. several jobs
+		// restarted by one spec change.
+		requeueAfter := wait.Jitter(pendingRerunRequeueInterval, 0.2)
+		logger.V(1).Info("Old Spark resources still exist, rechecking PENDING_RERUN SparkApplication",
+			"name", key.Name, "namespace", key.Namespace, "requeueAfter", requeueAfter)
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -933,6 +961,8 @@ func (r *Reconciler) updateDriverState(_ context.Context, app *v1beta2.SparkAppl
 		return fmt.Errorf("driver pod not found, while inside the grace period. Grace period of %v expires at %v", r.options.DriverPodCreationGracePeriod, app.Status.LastSubmissionAttemptTime.Add(r.options.DriverPodCreationGracePeriod))
 	}
 
+	adoptDriverSubmissionID(app, driverPod)
+
 	app.Status.SparkApplicationID = util.GetSparkApplicationID(driverPod)
 	driverState := util.GetDriverState(driverPod)
 	if util.IsDriverTerminated(driverState) {
@@ -958,6 +988,35 @@ func (r *Reconciler) updateDriverState(_ context.Context, app *v1beta2.SparkAppl
 	}
 
 	return nil
+}
+
+// adoptDriverSubmissionID copies the submission-id label of the app's own driver pod into
+// app.Status.SubmissionID. The ID is saved only after spark-submit returns, so a crash in between
+// leaves pods with an ID the app never saved, and the pod event filter drops all their events.
+// replacedStaleID reports whether a different, non-empty ID was overwritten.
+func adoptDriverSubmissionID(app *v1beta2.SparkApplication, driverPod *corev1.Pod) (replacedStaleID bool) {
+	podSubmissionID := driverPod.Labels[common.LabelSubmissionID]
+	if podSubmissionID == "" || podSubmissionID == app.Status.SubmissionID || !isAppDriver(app, driverPod) {
+		return false
+	}
+	replacedStaleID = app.Status.SubmissionID != ""
+	logger.Info("Adopting SubmissionID from driver pod",
+		"name", app.Name, "namespace", app.Namespace,
+		"appSubmissionID", app.Status.SubmissionID, "podSubmissionID", podSubmissionID,
+		"replacedStaleID", replacedStaleID)
+	app.Status.SubmissionID = podSubmissionID
+	return replacedStaleID
+}
+
+// isAppDriver reports whether driverPod belongs to app: it carries the app's name label and, if the
+// webhook has set a controller reference, that reference points at this app rather than at, for
+// example, an earlier application with the same name.
+func isAppDriver(app *v1beta2.SparkApplication, driverPod *corev1.Pod) bool {
+	if driverPod.Labels[common.LabelSparkAppName] != app.Name {
+		return false
+	}
+	ref := metav1.GetControllerOf(driverPod)
+	return ref == nil || ref.UID == app.UID
 }
 
 // updateExecutorState lists the executor pods of the application
@@ -1078,6 +1137,11 @@ func (r *Reconciler) updateSparkApplicationState(ctx context.Context, app *v1bet
 
 // updateSparkApplicationStatus updates the status of the SparkApplication.
 func (r *Reconciler) updateSparkApplicationStatus(ctx context.Context, app *v1beta2.SparkApplication) error {
+	// The manager cancels ctx when the operator shuts down. A reconcile that has already run
+	// spark-submit must still save the new SubmissionID; otherwise the pod event filter ignores
+	// the pods that spark-submit created.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), statusUpdateTimeout)
+	defer cancel()
 	if err := r.client.Status().Update(ctx, app); err != nil {
 		// Log failure with details
 		logger.Error(err, "FAILED to update SparkApplication status",
