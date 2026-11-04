@@ -22,6 +22,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/kubeflow/spark-operator/api/v1beta2"
 	"github.com/kubeflow/spark-operator/pkg/util"
@@ -378,6 +380,62 @@ func TestSchedule(t *testing.T) {
 			assert.Equal(t, "yunikorn", *tc.app.Spec.Executor.SchedulerName)
 		})
 	}
+}
+
+func TestAddAppIDLabels(t *testing.T) {
+	newApp := func(name, submissionID string) *v1beta2.SparkApplication {
+		return &v1beta2.SparkApplication{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status:     v1beta2.SparkApplicationStatus{SubmissionID: submissionID},
+		}
+	}
+
+	t.Run("assigns distinct driver and executor app ids", func(t *testing.T) {
+		app := newApp("spark-code-0bb544d3-20353b38", "b0d6f8a1-1c9e-4f6a-9d3e-2f1a5c7b8e40")
+		addAppIDLabels(app)
+
+		assert.Equal(t, "spark-code-0bb544d3-20353b38-driver-b0d6f8a1", app.Spec.Driver.Labels[appIDLabel])
+		assert.Equal(t, "spark-code-0bb544d3-20353b38-executors-b0d6f8a1", app.Spec.Executor.Labels[appIDLabel])
+	})
+
+	t.Run("changes on resubmission", func(t *testing.T) {
+		first := newApp("spark-code-0bb544d3-20353b38", "b0d6f8a1-1c9e-4f6a-9d3e-2f1a5c7b8e40")
+		addAppIDLabels(first)
+		second := newApp("spark-code-0bb544d3-20353b38", "44e21b7c-9a03-4de8-8c15-6b7d0e9f2a11")
+		addAppIDLabels(second)
+
+		assert.NotEqual(t, first.Spec.Driver.Labels[appIDLabel], second.Spec.Driver.Labels[appIDLabel])
+		assert.NotEqual(t, first.Spec.Executor.Labels[appIDLabel], second.Spec.Executor.Labels[appIDLabel])
+	})
+
+	t.Run("overrides a statically rendered app id", func(t *testing.T) {
+		app := newApp("spark-code-0bb544d3-20353b38", "b0d6f8a1-1c9e-4f6a-9d3e-2f1a5c7b8e40")
+		app.Spec.Driver.Labels = map[string]string{appIDLabel: "spark-code-0bb544d3-20353b38-driver"}
+		addAppIDLabels(app)
+
+		assert.Equal(t, "spark-code-0bb544d3-20353b38-driver-b0d6f8a1", app.Spec.Driver.Labels[appIDLabel])
+	})
+
+	t.Run("stays within the label value limit for long app names", func(t *testing.T) {
+		app := newApp("spark-code-with-an-unusually-long-application-name-0bb544d3-20353b38", "b0d6f8a1-1c9e-4f6a-9d3e-2f1a5c7b8e40")
+		addAppIDLabels(app)
+
+		driverAppID := app.Spec.Driver.Labels[appIDLabel]
+		executorAppID := app.Spec.Executor.Labels[appIDLabel]
+		assert.LessOrEqual(t, len(driverAppID), maxLabelValueLength)
+		assert.LessOrEqual(t, len(executorAppID), maxLabelValueLength)
+		assert.Empty(t, validation.IsValidLabelValue(driverAppID))
+		assert.Empty(t, validation.IsValidLabelValue(executorAppID))
+		assert.NotEqual(t, driverAppID, executorAppID)
+	})
+
+	t.Run("is a no-op without a submission id", func(t *testing.T) {
+		app := newApp("spark-code-0bb544d3-20353b38", "")
+		addAppIDLabels(app)
+
+		assert.NotContains(t, app.Spec.Driver.Labels, appIDLabel)
+		assert.NotContains(t, app.Spec.Executor.Labels, appIDLabel)
+	})
 }
 
 func TestMergeNodeSelector(t *testing.T) {

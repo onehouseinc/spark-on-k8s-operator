@@ -42,6 +42,19 @@ const (
 	taskGroupNameAnnotation = "yunikorn.apache.org/task-group-name"
 	taskGroupsAnnotation    = "yunikorn.apache.org/task-groups"
 	queueLabel              = "queue"
+	appIDLabel              = "yunikorn.apache.org/app-id"
+
+	// The driver and executors are submitted to separate queues, and one Yunikorn application
+	// cannot span two queues, so they must keep distinct application IDs.
+	driverAppIDRole   = "driver"
+	executorAppIDRole = "executors"
+
+	// Kubernetes caps label values at 63 characters.
+	maxLabelValueLength = 63
+
+	// Leading characters of the submission UUID kept in the application ID. Enough to
+	// distinguish consecutive submissions of the same application, which is all that matters.
+	appIDSubmissionIDLength = 8
 )
 
 // This struct has been defined separately rather than imported so that tags can be included for JSON marshalling
@@ -114,9 +127,11 @@ func (s *Scheduler) Schedule(app *v1beta2.SparkApplication) error {
 	app.Spec.Driver.SchedulerName = util.StringPtr(SchedulerName)
 	app.Spec.Executor.SchedulerName = util.StringPtr(SchedulerName)
 
-	// Yunikorn re-uses the application ID set by the driver under the label "spark-app-selector",
-	// so there is no need to set an application ID
+	// Yunikorn would otherwise re-use the application ID the driver sets under the label
+	// "spark-app-selector", but an explicit app-id label outranks it, and callers render a
+	// static one into .spec.sparkConf — so set it per submission here instead. [ENG-45235]
 	// https://github.com/apache/yunikorn-k8shim/blob/2278b3217c702ccb796e4d623bc7837625e5a4ec/pkg/common/utils/utils.go#L168-L171
+	addAppIDLabels(app)
 	addQueueLabels(app)
 	if err := addTaskGroupAnnotations(app, taskGroups); err != nil {
 		return fmt.Errorf("failed to add task group annotations: %w", err)
@@ -151,6 +166,37 @@ func addTaskGroupAnnotations(app *v1beta2.SparkApplication, taskGroups []taskGro
 	app.Spec.Driver.Annotations[taskGroupsAnnotation] = string(marshalledTaskGroups)
 
 	return nil
+}
+
+// addAppIDLabels gives each submission its own Yunikorn application ID. Reusing the previous
+// submission's ID makes a resubmitted driver attach to that application while it is still
+// Completing, and Yunikorn then orphans the task when the application completes. [ENG-45235]
+func addAppIDLabels(app *v1beta2.SparkApplication) {
+	if app.Status.SubmissionID == "" {
+		return
+	}
+	submissionID := app.Status.SubmissionID
+	if len(submissionID) > appIDSubmissionIDLength {
+		submissionID = submissionID[:appIDSubmissionIDLength]
+	}
+
+	if app.Spec.Driver.Labels == nil {
+		app.Spec.Driver.Labels = make(map[string]string)
+	}
+	if app.Spec.Executor.Labels == nil {
+		app.Spec.Executor.Labels = make(map[string]string)
+	}
+
+	app.Spec.Driver.Labels[appIDLabel] = appID(app.Name, driverAppIDRole, submissionID)
+	app.Spec.Executor.Labels[appIDLabel] = appID(app.Name, executorAppIDRole, submissionID)
+}
+
+func appID(name, role, submissionID string) string {
+	suffix := fmt.Sprintf("-%s-%s", role, submissionID)
+	if len(name)+len(suffix) > maxLabelValueLength {
+		name = name[:maxLabelValueLength-len(suffix)]
+	}
+	return name + suffix
 }
 
 func addQueueLabels(app *v1beta2.SparkApplication) {
