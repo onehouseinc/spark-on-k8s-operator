@@ -271,7 +271,7 @@ func start() {
 		mgr.GetClient(),
 		mgr.GetEventRecorderFor("spark-application-controller"),
 		registry,
-		newSparkApplicationReconcilerOptions(),
+		newSparkApplicationReconcilerOptions(mgr.GetAPIReader()),
 	).SetupWithManager(mgr, newControllerOptions()); err != nil {
 		logger.Error(err, "Failed to create controller", "controller", "SparkApplication")
 		os.Exit(1)
@@ -392,7 +392,7 @@ func newControllerOptions() controller.Options {
 	return options
 }
 
-func newSparkApplicationReconcilerOptions() sparkapplication.Options {
+func newSparkApplicationReconcilerOptions(apiReader client.Reader) sparkapplication.Options {
 	var sparkApplicationMetrics *metrics.SparkApplicationMetrics
 	var sparkExecutorMetrics *metrics.SparkExecutorMetrics
 	if enableMetrics {
@@ -402,6 +402,7 @@ func newSparkApplicationReconcilerOptions() sparkapplication.Options {
 		sparkExecutorMetrics.Register()
 	}
 	options := sparkapplication.Options{
+		APIReader:                    apiReader,
 		Namespaces:                   namespaces,
 		EnableUIService:              enableUIService,
 		IngressClassName:             ingressClassName,

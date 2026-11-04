@@ -1,0 +1,163 @@
+/*
+Copyright 2026 The Kubeflow authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package sparkapplication
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+
+	"github.com/kubeflow/spark-operator/api/v1beta2"
+	"github.com/kubeflow/spark-operator/pkg/util"
+)
+
+func TestSpecUpdateDoesNotMutateInformerObject(t *testing.T) {
+	oldApp, app := specUpdateApplications()
+	before := app.DeepCopy()
+	c := specUpdateClient(t, app)
+	filter := NewSparkApplicationEventFilter(c, c, record.NewFakeRecorder(10), nil)
+
+	require.True(t, filter.Update(event.UpdateEvent{ObjectOld: oldApp, ObjectNew: app}))
+	require.Equal(t, before, app)
+	stored := &v1beta2.SparkApplication{}
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(app), stored))
+	require.Equal(t, v1beta2.ApplicationStateInvalidating, stored.Status.AppState.State)
+}
+
+func TestSpecUpdateRetriesMetadataConflict(t *testing.T) {
+	oldApp, app := specUpdateApplications()
+	c := specUpdateClient(t, app)
+	updates := 0
+	writer := interceptor.NewClient(c, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, underlying client.Client, subresource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			updates++
+			if updates == 1 {
+				latest := &v1beta2.SparkApplication{}
+				if err := c.Get(ctx, client.ObjectKeyFromObject(app), latest); err != nil {
+					return err
+				}
+				latest.Annotations = map[string]string{"external-update": "preserved"}
+				if err := c.Update(ctx, latest); err != nil {
+					return err
+				}
+				return apierrors.NewConflict(schema.GroupResource{Group: "sparkoperator.k8s.io", Resource: "sparkapplications"}, app.Name, errors.New("metadata changed"))
+			}
+			return underlying.SubResource(subresource).Update(ctx, obj, opts...)
+		},
+	})
+	filter := NewSparkApplicationEventFilter(writer, c, record.NewFakeRecorder(10), nil)
+
+	require.True(t, filter.Update(event.UpdateEvent{ObjectOld: oldApp, ObjectNew: app}))
+	stored := &v1beta2.SparkApplication{}
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(app), stored))
+	require.Equal(t, v1beta2.ApplicationStateInvalidating, stored.Status.AppState.State)
+	require.Equal(t, "preserved", stored.Annotations["external-update"])
+}
+
+func TestSpecUpdateStillEnqueuesAfterWriteFailure(t *testing.T) {
+	oldApp, app := specUpdateApplications()
+	c := specUpdateClient(t, app)
+	writer := interceptor.NewClient(c, interceptor.Funcs{
+		SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+			return errors.New("API unavailable")
+		},
+	})
+	filter := NewSparkApplicationEventFilter(writer, c, record.NewFakeRecorder(10), nil)
+
+	require.True(t, filter.Update(event.UpdateEvent{ObjectOld: oldApp, ObjectNew: app}))
+}
+
+func TestSpecUpdateIgnoresSupersededEvents(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*v1beta2.SparkApplication)
+	}{
+		{
+			name: "recreated application",
+			change: func(app *v1beta2.SparkApplication) {
+				app.UID = "replacement-uid"
+			},
+		},
+		{
+			name: "newer generation",
+			change: func(app *v1beta2.SparkApplication) {
+				app.Generation++
+				app.Spec.Driver.CoreLimit = util.StringPtr("8")
+			},
+		},
+		{
+			name: "newer submission",
+			change: func(app *v1beta2.SparkApplication) {
+				app.Status.SubmissionID = "run-b"
+			},
+		},
+		{
+			name: "deleting application",
+			change: func(app *v1beta2.SparkApplication) {
+				now := metav1.Now()
+				app.DeletionTimestamp = &now
+				app.Finalizers = []string{"test-finalizer"}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			oldApp, app := specUpdateApplications()
+			latest := app.DeepCopy()
+			test.change(latest)
+			latest.ResourceVersion = "3"
+			c := specUpdateClient(t, latest)
+			filter := NewSparkApplicationEventFilter(c, c, record.NewFakeRecorder(10), nil)
+
+			require.True(t, filter.Update(event.UpdateEvent{ObjectOld: oldApp, ObjectNew: app}))
+			stored := &v1beta2.SparkApplication{}
+			require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(app), stored))
+			require.Equal(t, latest.Status, stored.Status)
+			require.Equal(t, latest.ResourceVersion, stored.ResourceVersion)
+		})
+	}
+}
+
+func specUpdateApplications() (*v1beta2.SparkApplication, *v1beta2.SparkApplication) {
+	app := &v1beta2.SparkApplication{
+		ObjectMeta: metav1.ObjectMeta{Name: "spec-update", Namespace: "default", UID: "app-uid", Generation: 2, ResourceVersion: "2"},
+		Spec:       v1beta2.SparkApplicationSpec{Driver: v1beta2.DriverSpec{SparkPodSpec: v1beta2.SparkPodSpec{CoreLimit: util.StringPtr("4")}}},
+		Status:     v1beta2.SparkApplicationStatus{SubmissionID: "run-a", AppState: v1beta2.ApplicationState{State: v1beta2.ApplicationStateRunning}},
+	}
+	oldApp := app.DeepCopy()
+	oldApp.Generation = 1
+	oldApp.ResourceVersion = "1"
+	oldApp.Spec.Driver.CoreLimit = util.StringPtr("2")
+	return oldApp, app
+}
+
+func specUpdateClient(t *testing.T, app *v1beta2.SparkApplication) client.WithWatch {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1beta2.AddToScheme(scheme))
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(app).WithStatusSubresource(&v1beta2.SparkApplication{}).Build()
+}

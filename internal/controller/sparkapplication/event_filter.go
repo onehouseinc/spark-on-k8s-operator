@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -114,13 +115,14 @@ func (f *sparkPodEventFilter) filter(pod *corev1.Pod) bool {
 
 type EventFilter struct {
 	client     client.Client
+	apiReader  client.Reader
 	recorder   record.EventRecorder
 	namespaces map[string]bool
 }
 
 var _ predicate.Predicate = &EventFilter{}
 
-func NewSparkApplicationEventFilter(client client.Client, recorder record.EventRecorder, namespaces []string) *EventFilter {
+func NewSparkApplicationEventFilter(client client.Client, apiReader client.Reader, recorder record.EventRecorder, namespaces []string) *EventFilter {
 	nsMap := make(map[string]bool)
 	if len(namespaces) == 0 {
 		nsMap[metav1.NamespaceAll] = true
@@ -132,6 +134,7 @@ func NewSparkApplicationEventFilter(client client.Client, recorder record.EventR
 
 	return &EventFilter{
 		client:     client,
+		apiReader:  apiReader,
 		recorder:   recorder,
 		namespaces: nsMap,
 	}
@@ -167,13 +170,22 @@ func (f *EventFilter) Update(e event.UpdateEvent) bool {
 		return false
 	}
 
-	// The spec has changed. This is currently best effort as we can potentially miss updates
-	// and end up in an inconsistent state.
 	if !equality.Semantic.DeepEqual(oldApp.Spec, newApp.Spec) {
-		// Force-set the application status to Invalidating which handles clean-up and application re-run.
-		newApp.Status.AppState.State = v1beta2.ApplicationStateInvalidating
-		logger.Info("Updating SparkApplication status", "name", newApp.Name, "namespace", newApp.Namespace, " oldState", oldApp.Status.AppState.State, "newState", newApp.Status.AppState.State)
-		if err := f.client.Status().Update(context.TODO(), newApp); err != nil {
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			latest := &v1beta2.SparkApplication{}
+			if err := f.apiReader.Get(context.TODO(), client.ObjectKeyFromObject(newApp), latest); err != nil {
+				return client.IgnoreNotFound(err)
+			}
+			// A delayed event must not invalidate a replacement app or a newer submission.
+			if latest.UID != newApp.UID || latest.Generation != newApp.Generation ||
+				latest.Status.SubmissionID != newApp.Status.SubmissionID ||
+				!latest.DeletionTimestamp.IsZero() || latest.Status.AppState.State == v1beta2.ApplicationStateInvalidating {
+				return nil
+			}
+			latest.Status.AppState.State = v1beta2.ApplicationStateInvalidating
+			return f.client.Status().Update(context.TODO(), latest)
+		})
+		if err != nil {
 			logger.Error(err, "Failed to update application status", "application", newApp.Name)
 			f.recorder.Eventf(
 				newApp,
@@ -183,7 +195,6 @@ func (f *EventFilter) Update(e event.UpdateEvent) bool {
 				newApp.Name,
 				err,
 			)
-			return false
 		}
 	}
 
