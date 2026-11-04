@@ -35,6 +35,7 @@ type submission struct {
 	namespace string
 	name      string
 	args      []string
+	startTime time.Time
 }
 
 func newSubmission(args []string, app *v1beta2.SparkApplication) *submission {
@@ -42,6 +43,7 @@ func newSubmission(args []string, app *v1beta2.SparkApplication) *submission {
 		namespace: app.Namespace,
 		name:      app.Name,
 		args:      args,
+		startTime: app.Status.LastSubmissionAttemptTime.Time,
 	}
 }
 
@@ -51,7 +53,8 @@ func runSparkSubmit(submission *submission, timeout time.Duration) error {
 		return fmt.Errorf("env %s is not specified", common.EnvSparkHome)
 	}
 	command := filepath.Join(sparkHome, "bin", "spark-submit")
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	// Preparation and process execution share the deadline used by recovery.
+	ctx, cancel := context.WithDeadline(context.Background(), submission.startTime.Add(timeout))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, command, submission.args...)
 	cmd.WaitDelay = time.Second

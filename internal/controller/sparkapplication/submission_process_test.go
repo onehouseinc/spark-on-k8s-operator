@@ -31,7 +31,7 @@ import (
 func TestSubmissionProcessTimeout(t *testing.T) {
 	installSparkSubmit(t, "exec sleep 30\n")
 	start := time.Now()
-	err := runSparkSubmit(&submission{}, 50*time.Millisecond)
+	err := runSparkSubmit(&submission{startTime: start}, 50*time.Millisecond)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected submission deadline, got %v", err)
 	}
@@ -52,7 +52,7 @@ func TestSubmissionProcessResults(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			installSparkSubmit(t, tt.body)
-			err := runSparkSubmit(&submission{}, 5*time.Second)
+			err := runSparkSubmit(&submission{startTime: time.Now()}, 5*time.Second)
 			if tt.want == "" {
 				if err != nil {
 					t.Fatal(err)
@@ -69,7 +69,7 @@ func TestSubmissionProcessArguments(t *testing.T) {
 	t.Setenv("SUBMISSION_TEST_ARGUMENTS", path)
 	installSparkSubmit(t, "printf '%s\\n' \"$@\" > \"$SUBMISSION_TEST_ARGUMENTS\"\n")
 	args := []string{"--conf", "spark.test=value with spaces", "local:///app.jar"}
-	if err := runSparkSubmit(&submission{args: args}, 5*time.Second); err != nil {
+	if err := runSparkSubmit(&submission{args: args, startTime: time.Now()}, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(path)

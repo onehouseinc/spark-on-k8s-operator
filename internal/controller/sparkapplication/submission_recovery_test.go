@@ -85,23 +85,53 @@ var _ = Describe("submission recovery", Serial, func() {
 	DescribeTable("retries only the outcome after a metadata conflict", func(state v1beta2.ApplicationStateType) {
 		app := newRecoveryApplication(state)
 		submit := newControlledSubmit(true)
-		done := startRecoveryReconcile(newRecoveryReconciler(k8sClient), app, submit)
+		var outcomeWrites, conflicts atomic.Int32
+		writer := recoveryIntercept(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subresource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if updated, ok := obj.(*v1beta2.SparkApplication); ok && subresource == "status" &&
+					updated.Status.AppState.State == v1beta2.ApplicationStateSubmitted {
+					if outcomeWrites.Add(1) == 1 {
+						latest := getRecoveryApplication(app)
+						latest.Annotations = map[string]string{"test.sparkoperator.k8s.io/concurrent-write": "true"}
+						Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+					}
+					err := c.SubResource(subresource).Update(ctx, obj, opts...)
+					if apierrors.IsConflict(err) {
+						conflicts.Add(1)
+					}
+					return err
+				}
+				return c.SubResource(subresource).Update(ctx, obj, opts...)
+			},
+		})
+		r := newRecoveryReconciler(writer)
+		done := startRecoveryReconcile(r, app, submit)
 		submit.waitForInvocation()
 		pod := createRecoveryDriver(app, submit)
-		latest := getRecoveryApplication(app)
-		latest.Annotations = map[string]string{"test.sparkoperator.k8s.io/concurrent-write": "true"}
-		Expect(k8sClient.Update(context.Background(), latest)).To(Succeed())
+		intent := getRecoveryApplication(app)
 
 		submit.release()
 		var outcome recoveryResult
 		Eventually(done, 10*time.Second).Should(Receive(&outcome))
 		Expect(outcome.err).NotTo(HaveOccurred())
 
+		Expect(conflicts.Load()).To(Equal(int32(1)))
+		Expect(outcomeWrites.Load()).To(Equal(int32(2)))
 		Expect(submit.invocations()).To(Equal(1))
-		latest = getRecoveryApplication(app)
+		latest := getRecoveryApplication(app)
 		Expect(latest.Status.SubmissionID).To(Equal(pod.Labels[common.LabelSubmissionID]))
 		Expect(latest.Status.AppState.State).To(Equal(v1beta2.ApplicationStateSubmitted))
+		Expect(latest.Status.SubmissionAttempts).To(Equal(intent.Status.SubmissionAttempts + 1))
+		Expect(latest.Status.ExecutionAttempts).To(Equal(intent.Status.ExecutionAttempts + 1))
 		Expect(latest.Annotations).To(HaveKeyWithValue("test.sparkoperator.k8s.io/concurrent-write", "true"))
+
+		_, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(app)})
+		Expect(err).NotTo(HaveOccurred())
+		recovered := getRecoveryApplication(app)
+		Expect(recovered.Status.SubmissionID).To(Equal(latest.Status.SubmissionID))
+		Expect(recovered.Status.SubmissionAttempts).To(Equal(latest.Status.SubmissionAttempts))
+		Expect(recovered.Status.ExecutionAttempts).To(Equal(latest.Status.ExecutionAttempts))
+		Expect(submit.invocations()).To(Equal(1))
 		current := &corev1.Pod{}
 		Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(pod), current)).To(Succeed())
 		Expect(current.UID).To(Equal(pod.UID))

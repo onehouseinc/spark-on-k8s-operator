@@ -85,8 +85,22 @@ var _ = Describe("submission handoff before driver creation", Serial, func() {
 		app.Status.AppState.ErrorMessage = savedError
 		Expect(k8sClient.Status().Update(context.Background(), app)).To(Succeed())
 		submit := newControlledSubmit(false)
+		r := newRecoveryReconciler(k8sClient)
+		request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(app)}
+		attempts := app.Status.SubmissionAttempts
+		if savedError == "" {
+			_, err := r.Reconcile(context.Background(), request)
+			Expect(err).NotTo(HaveOccurred())
+			latest := getRecoveryApplication(app)
+			Expect(latest.Status.AppState.State).To(Equal(v1beta2.ApplicationStateFailedSubmission))
+			Expect(latest.Status.AppState.ErrorMessage).To(ContainSubstring("timed out"))
+			Expect(latest.Status.SubmissionID).To(Equal("previous-run"))
+			attempts++
+			Expect(latest.Status.SubmissionAttempts).To(Equal(attempts))
+			Expect(submit.invocations()).To(BeZero())
+		}
 
-		_, err := newRecoveryReconciler(k8sClient).Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(app)})
+		_, err := r.Reconcile(context.Background(), request)
 
 		Expect(err).NotTo(HaveOccurred())
 		Expect(submit.invocations()).To(Equal(1))
@@ -96,10 +110,70 @@ var _ = Describe("submission handoff before driver creation", Serial, func() {
 		Expect(latest.Status.SubmissionID).To(Equal(submit.submissionID()))
 		Expect(latest.Status.AppState.ErrorMessage).To(BeEmpty())
 		Expect(latest.Status.LastSubmissionAttemptTime.After(app.Status.LastSubmissionAttemptTime.Time)).To(BeTrue())
+		Expect(latest.Status.SubmissionAttempts).To(Equal(attempts + 1))
 	},
 		Entry("NEW intent exceeded the default ten-minute timeout", v1beta2.ApplicationStateNew, 11*time.Minute, ""),
 		Entry("SUBMISSION_FAILED intent exceeded the default ten-minute timeout", v1beta2.ApplicationStateFailedSubmission, 11*time.Minute, ""),
 		Entry("PENDING_RERUN intent exceeded the default ten-minute timeout", v1beta2.ApplicationStatePendingRerun, 11*time.Minute, ""),
 		Entry("a saved failure is already due for retry", v1beta2.ApplicationStateFailedSubmission, time.Minute, "spark-submit failed before driver creation"),
 	)
+
+	DescribeTable("honors the restart policy after a driverless intent expires", func(state v1beta2.ApplicationStateType, policy v1beta2.RestartPolicyType, attempts int32) {
+		app := newRecoveryApplication(state)
+		app.Spec.RestartPolicy.Type = policy
+		app.Spec.RestartPolicy.OnSubmissionFailureRetries = util.Int32Ptr(1)
+		Expect(k8sClient.Update(context.Background(), app)).To(Succeed())
+		app.Status.SubmissionID = "lost-failed-outcome"
+		app.Status.LastSubmissionAttemptTime = metav1.NewTime(time.Now().Add(-11 * time.Minute))
+		app.Status.SubmissionAttempts = attempts
+		Expect(k8sClient.Status().Update(context.Background(), app)).To(Succeed())
+		submit := newControlledSubmit(false)
+		r := newRecoveryReconciler(k8sClient)
+		request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(app)}
+
+		_, err := r.Reconcile(context.Background(), request)
+		Expect(err).NotTo(HaveOccurred())
+		latest := getRecoveryApplication(app)
+		Expect(latest.Status.AppState.State).To(Equal(v1beta2.ApplicationStateFailedSubmission))
+		Expect(latest.Status.SubmissionAttempts).To(Equal(attempts + 1))
+		Expect(latest.Status.SubmissionID).To(Equal("lost-failed-outcome"))
+		Expect(submit.invocations()).To(BeZero())
+
+		for range 2 {
+			_, err = r.Reconcile(context.Background(), request)
+			Expect(err).NotTo(HaveOccurred())
+			latest = getRecoveryApplication(app)
+			Expect(latest.Status.AppState.State).To(Equal(v1beta2.ApplicationStateFailed))
+			Expect(latest.Status.SubmissionAttempts).To(Equal(attempts + 1))
+			Expect(latest.Status.SubmissionID).To(Equal("lost-failed-outcome"))
+			Expect(submit.invocations()).To(BeZero())
+		}
+	},
+		Entry("Never does not launch a second attempt", v1beta2.ApplicationStateNew, v1beta2.RestartPolicyNever, int32(0)),
+		Entry("OnFailure stops after its final permitted attempt", v1beta2.ApplicationStateFailedSubmission, v1beta2.RestartPolicyOnFailure, int32(1)),
+	)
+
+	It("counts an expired driverless intent only once while waiting for its retry", func() {
+		app := newRecoveryApplication(v1beta2.ApplicationStateNew)
+		app.Spec.RestartPolicy.OnSubmissionFailureRetryInterval = util.Int64Ptr(3600)
+		Expect(k8sClient.Update(context.Background(), app)).To(Succeed())
+		app.Status.SubmissionID = "expired-intent"
+		app.Status.LastSubmissionAttemptTime = metav1.NewTime(time.Now().Add(-11 * time.Minute))
+		Expect(k8sClient.Status().Update(context.Background(), app)).To(Succeed())
+		submit := newControlledSubmit(false)
+		r := newRecoveryReconciler(k8sClient)
+		request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(app)}
+
+		for range 3 {
+			result, err := r.Reconcile(context.Background(), request)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			latest := getRecoveryApplication(app)
+			Expect(latest.Status.AppState.State).To(Equal(v1beta2.ApplicationStateFailedSubmission))
+			Expect(latest.Status.SubmissionAttempts).To(Equal(int32(1)))
+			Expect(latest.Status.SubmissionID).To(Equal("expired-intent"))
+			Expect(latest.Status.LastSubmissionAttemptTime).To(Equal(app.Status.LastSubmissionAttemptTime))
+			Expect(submit.invocations()).To(BeZero())
+		}
+	})
 })

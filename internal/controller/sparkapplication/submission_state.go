@@ -56,9 +56,16 @@ func (r *Reconciler) reconcileSubmission(ctx context.Context, req ctrl.Request, 
 		// A previous operator may still be submitting after leadership changes.
 		// Keep its identity until the bounded submit process has had time to exit.
 		if app.Status.SubmissionID != "" && !app.Status.LastSubmissionAttemptTime.IsZero() &&
-			app.Status.TerminationTime.IsZero() && app.Status.AppState.ErrorMessage == "" &&
-			time.Since(app.Status.LastSubmissionAttemptTime.Time) < r.options.SparkSubmitTimeout {
-			return nil
+			app.Status.TerminationTime.IsZero() && app.Status.AppState.ErrorMessage == "" {
+			if time.Since(app.Status.LastSubmissionAttemptTime.Time) < r.options.SparkSubmitTimeout {
+				return nil
+			}
+			app.Status.SubmissionAttempts++
+			app.Status.AppState = v1beta2.ApplicationState{
+				State:        v1beta2.ApplicationStateFailedSubmission,
+				ErrorMessage: "submission timed out before driver creation",
+			}
+			return r.updateSparkApplicationStatus(ctx, app)
 		}
 		if state == v1beta2.ApplicationStateFailedSubmission {
 			if !util.ShouldRetry(app) {
