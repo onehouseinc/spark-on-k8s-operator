@@ -122,7 +122,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				nil,
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}, DriverPodCreationGracePeriod: 10 * time.Second},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}, DriverPodCreationGracePeriod: 10 * time.Second},
 			)
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).To(MatchError(ContainSubstring("driver pod not found, while inside the grace period. Grace period of")))
@@ -139,7 +139,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				nil,
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}, DriverPodCreationGracePeriod: 0 * time.Second},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}, DriverPodCreationGracePeriod: 0 * time.Second},
 			)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
@@ -205,7 +205,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				nil,
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}, DriverPodCreationGracePeriod: 0 * time.Second},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}, DriverPodCreationGracePeriod: 0 * time.Second},
 			)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
@@ -266,7 +266,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				nil,
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}},
 			)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
@@ -325,7 +325,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				nil,
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}},
 			)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
@@ -379,7 +379,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				nil,
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}},
 			)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
@@ -438,7 +438,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				nil,
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}},
 			)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
@@ -520,7 +520,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				record.NewFakeRecorder(3),
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 10},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 10},
 			)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
@@ -539,7 +539,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				record.NewFakeRecorder(3),
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 1},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 1},
 			)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
@@ -578,14 +578,16 @@ var _ = Describe("SparkApplication Controller", func() {
 
 				// Create a running driver pod (simulating operator restart scenario)
 				driverPod := createDriverPod(appName, appNamespace)
+				driverPod.Labels[common.LabelSubmissionID] = "recorded-run"
 				Expect(k8sClient.Create(ctx, driverPod)).To(Succeed())
 				driverPod.Status.Phase = corev1.PodRunning
 				Expect(k8sClient.Status().Update(ctx, driverPod)).To(Succeed())
 
-				// Set app to pending rerun with no start time or attempts
+				// Recover a recorded submission whose outcome was lost.
 				app.Status.AppState.State = v1beta2.ApplicationStatePendingRerun
 				app.Status.DriverInfo.PodName = driverPod.Name
-				app.Status.LastSubmissionAttemptTime = metav1.Time{} // Empty time
+				app.Status.LastSubmissionAttemptTime = metav1.Now()
+				app.Status.SubmissionID = "recorded-run"
 				app.Status.ExecutionAttempts = 0
 				Expect(k8sClient.Status().Update(ctx, app)).To(Succeed())
 			}
@@ -612,7 +614,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				record.NewFakeRecorder(3),
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}},
 			)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
@@ -621,7 +623,7 @@ var _ = Describe("SparkApplication Controller", func() {
 			app := &v1beta2.SparkApplication{}
 			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
 
-			// Verify that start time was set from pod creation time
+			// The recorded submission time is retained.
 			Expect(app.Status.LastSubmissionAttemptTime.IsZero()).To(BeFalse())
 
 			// Verify that execution attempts was set to 1
@@ -659,14 +661,16 @@ var _ = Describe("SparkApplication Controller", func() {
 
 				// Create a pending driver pod
 				driverPod := createDriverPod(appName, appNamespace)
+				driverPod.Labels[common.LabelSubmissionID] = "recorded-run"
 				Expect(k8sClient.Create(ctx, driverPod)).To(Succeed())
 				driverPod.Status.Phase = corev1.PodPending
 				Expect(k8sClient.Status().Update(ctx, driverPod)).To(Succeed())
 
-				// Set app to pending rerun with no start time or attempts
+				// Recover a recorded submission whose outcome was lost.
 				app.Status.AppState.State = v1beta2.ApplicationStatePendingRerun
 				app.Status.DriverInfo.PodName = driverPod.Name
-				app.Status.LastSubmissionAttemptTime = metav1.Time{} // Empty time
+				app.Status.LastSubmissionAttemptTime = metav1.Now()
+				app.Status.SubmissionID = "recorded-run"
 				app.Status.ExecutionAttempts = 0
 				Expect(k8sClient.Status().Update(ctx, app)).To(Succeed())
 			}
@@ -693,7 +697,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				record.NewFakeRecorder(3),
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}},
 			)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
@@ -702,7 +706,7 @@ var _ = Describe("SparkApplication Controller", func() {
 			app := &v1beta2.SparkApplication{}
 			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
 
-			// Verify that start time was set from pod creation time
+			// The recorded submission time is retained.
 			Expect(app.Status.LastSubmissionAttemptTime.IsZero()).To(BeFalse())
 
 			// Verify that execution attempts was set to 1
@@ -772,7 +776,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				record.NewFakeRecorder(3),
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}},
 			)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
@@ -856,10 +860,10 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				record.NewFakeRecorder(3),
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}},
 			)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
-			Expect(err).NotTo(HaveOccurred())
+			Expect(err).To(MatchError(ContainSubstring("does not belong")))
 			Expect(result.Requeue).To(BeFalse())
 
 			app := &v1beta2.SparkApplication{}
@@ -945,7 +949,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				k8sClient,
 				record.NewFakeRecorder(3),
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}},
 			)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
@@ -970,6 +974,8 @@ func getDriverNamespacedName(appName string, appNamespace string) types.Namespac
 	}
 }
 
+// createDriverPod builds a driver fixture and emulates the webhook's owner reference
+// when the application exists; callers control when the pod and its status are saved.
 func createDriverPod(appName string, appNamespace string) *corev1.Pod {
 	namespacedName := getDriverNamespacedName(appName, appNamespace)
 	pod := &corev1.Pod{
@@ -990,6 +996,12 @@ func createDriverPod(appName string, appNamespace string) *corev1.Pod {
 				},
 			},
 		},
+	}
+	app := &v1beta2.SparkApplication{}
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: appName, Namespace: appNamespace}, app); err == nil {
+		pod.OwnerReferences = []metav1.OwnerReference{util.GetOwnerReference(app)}
+	} else {
+		Expect(errors.IsNotFound(err)).To(BeTrue())
 	}
 	return pod
 }
@@ -1054,6 +1066,8 @@ var _ = Describe("Orphaned Resource Cleanup", func() {
 			}
 			v1beta2.SetSparkApplicationDefaults(app)
 			Expect(k8sClient.Create(ctx, app)).To(Succeed())
+			driverPod.OwnerReferences = []metav1.OwnerReference{util.GetOwnerReference(app)}
+			Expect(k8sClient.Update(ctx, driverPod)).To(Succeed())
 
 			// Application state should be NEW (empty string)
 			app.Status.AppState.State = v1beta2.ApplicationStateNew
@@ -1082,15 +1096,14 @@ var _ = Describe("Orphaned Resource Cleanup", func() {
 				k8sClient,
 				&record.FakeRecorder{},
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}},
 			)
 
-			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 
-			By("Expecting error indicating orphaned resources were deleted")
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("orphaned resources"))
-			Expect(err.Error()).To(ContainSubstring("were deleted, requeuing for submission"))
+			By("Expecting a timed recheck after cleanup")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 
 			By("Verifying driver pod was deleted")
 			Eventually(func() bool {
@@ -1148,7 +1161,7 @@ var _ = Describe("Orphaned Resource Cleanup", func() {
 				k8sClient,
 				&record.FakeRecorder{},
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}},
 			)
 
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
@@ -1209,6 +1222,8 @@ var _ = Describe("Orphaned Resource Cleanup", func() {
 			}
 			v1beta2.SetSparkApplicationDefaults(app)
 			Expect(k8sClient.Create(ctx, app)).To(Succeed())
+			service.OwnerReferences = []metav1.OwnerReference{util.GetOwnerReference(app)}
+			Expect(k8sClient.Update(ctx, service)).To(Succeed())
 
 			// Set status with service name to trigger validation
 			app.Status.AppState.State = v1beta2.ApplicationStateNew
@@ -1240,14 +1255,14 @@ var _ = Describe("Orphaned Resource Cleanup", func() {
 				k8sClient,
 				&record.FakeRecorder{},
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}},
 			)
 
-			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 
-			By("Expecting error indicating orphaned resources were deleted")
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("orphaned resources"))
+			By("Expecting a timed recheck after cleanup")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 
 			By("Verifying service was deleted")
 			Eventually(func() bool {
@@ -1311,6 +1326,10 @@ var _ = Describe("Orphaned Resource Cleanup", func() {
 			}
 			v1beta2.SetSparkApplicationDefaults(app)
 			Expect(k8sClient.Create(ctx, app)).To(Succeed())
+			driverPod.OwnerReferences = []metav1.OwnerReference{util.GetOwnerReference(app)}
+			Expect(k8sClient.Update(ctx, driverPod)).To(Succeed())
+			service.OwnerReferences = []metav1.OwnerReference{util.GetOwnerReference(app)}
+			Expect(k8sClient.Update(ctx, service)).To(Succeed())
 
 			app.Status.AppState.State = v1beta2.ApplicationStateNew
 			app.Status.DriverInfo.WebUIServiceName = service.Name
@@ -1346,14 +1365,14 @@ var _ = Describe("Orphaned Resource Cleanup", func() {
 				k8sClient,
 				&record.FakeRecorder{},
 				nil,
-				sparkapplication.Options{Namespaces: []string{appNamespace}},
+				sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{appNamespace}},
 			)
 
-			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 
-			By("Expecting error indicating cleanup occurred")
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("orphaned resources"))
+			By("Expecting a timed recheck after cleanup")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 
 			By("Verifying all resources were deleted")
 			Eventually(func() bool {

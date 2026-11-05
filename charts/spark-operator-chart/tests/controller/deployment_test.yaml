@@ -661,6 +661,30 @@ tests:
           path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
           content: --driver-pod-creation-grace-period=30s
 
+  - it: Should use the default submission timeout
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --submission-timeout=10m
+
+  - it: Should use the specified submission timeout
+    set:
+      controller:
+        submissionTimeout: 25m
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --submission-timeout=25m
+
+  - it: Should preserve the default submission timeout when reusing older values
+    set:
+      controller:
+        submissionTimeout: null
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --submission-timeout=10m
+
   - it: Should contain `--max-tracked-executor-per-app` arg if `controller.maxTrackedExecutorPerApp` is set
     set:
       controller:

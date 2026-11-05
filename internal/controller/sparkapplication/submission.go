@@ -17,41 +17,59 @@ limitations under the License.
 package sparkapplication
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/kubeflow/spark-operator/api/v1beta2"
 	"github.com/kubeflow/spark-operator/pkg/common"
 	"github.com/kubeflow/spark-operator/pkg/util"
 )
 
-// submission includes information of a Spark application to be submitted.
-type submission struct {
-	namespace string
-	name      string
-	args      []string
+// sparkSubmitCommand binds process arguments to the already recorded attempt.
+// Its deadline starts at that attempt's timestamp, including preparation time.
+type sparkSubmitCommand struct {
+	namespace        string
+	name             string
+	args             []string
+	attemptStartTime time.Time
 }
 
-func newSubmission(args []string, app *v1beta2.SparkApplication) *submission {
-	return &submission{
-		namespace: app.Namespace,
-		name:      app.Name,
-		args:      args,
+// newSparkSubmitCommand carries the persisted attempt time into process execution
+// so a restart and the original submitter agree on when the attempt expires.
+func newSparkSubmitCommand(args []string, app *v1beta2.SparkApplication) *sparkSubmitCommand {
+	return &sparkSubmitCommand{
+		namespace:        app.Namespace,
+		name:             app.Name,
+		args:             args,
+		attemptStartTime: app.Status.LastSubmissionAttemptTime.Time,
 	}
 }
 
-func runSparkSubmit(submission *submission) error {
+// runSparkSubmit runs one process within the recorded attempt's deadline. It is
+// independent of reconcile cancellation so leadership handoff does not interrupt
+// an otherwise viable submit; recovery uses live resources to interpret failures.
+func runSparkSubmit(submitCommand *sparkSubmitCommand, timeout time.Duration) error {
 	sparkHome, present := os.LookupEnv(common.EnvSparkHome)
 	if !present {
 		return fmt.Errorf("env %s is not specified", common.EnvSparkHome)
 	}
 	command := filepath.Join(sparkHome, "bin", "spark-submit")
-	cmd := exec.Command(command, submission.args...)
+	// Preparation and process execution share the deadline used by recovery.
+	ctx, cancel := context.WithDeadline(context.Background(), submitCommand.attemptStartTime.Add(timeout))
+	defer cancel()
+	cmd := exec.CommandContext(ctx, command, submitCommand.args...)
+	// Bound waiting for inherited output pipes after the process exits or is killed.
+	cmd.WaitDelay = time.Second
 	_, err := cmd.Output()
 	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("spark-submit timed out after %s: %w", timeout, ctx.Err())
+		}
 		var errorMsg string
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			errorMsg = string(exitErr.Stderr)
@@ -259,6 +277,9 @@ func submissionWaitAppCompletionOption(_ *v1beta2.SparkApplication) ([]string, e
 	return args, nil
 }
 
+// sparkConfOption passes through user settings except controller-owned identity
+// and submission-lifetime settings. Overrides could hide the driver from recovery
+// or keep spark-submit waiting for the entire application to finish.
 func sparkConfOption(app *v1beta2.SparkApplication) ([]string, error) {
 	if app.Spec.SparkConf == nil {
 		return nil, nil
@@ -266,10 +287,17 @@ func sparkConfOption(app *v1beta2.SparkApplication) ([]string, error) {
 	var args []string
 	// Add Spark configuration properties.
 	for key, value := range app.Spec.SparkConf {
-		// Configuration property for the driver pod name has already been set.
-		if key != common.SparkKubernetesDriverPodName {
-			args = append(args, "--conf", fmt.Sprintf("%s=%s", key, value))
+		switch key {
+		case common.SparkKubernetesDriverPodName, common.SparkKubernetesSubmissionWaitAppCompletion,
+			fmt.Sprintf(common.SparkKubernetesDriverAnnotationTemplate, common.AnnotationAppUID),
+			fmt.Sprintf(common.SparkKubernetesDriverAnnotationTemplate, common.AnnotationAppGeneration),
+			fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, common.LabelSparkAppName),
+			fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, common.LabelSubmissionID),
+			fmt.Sprintf(common.SparkKubernetesExecutorLabelTemplate, common.LabelSparkAppName),
+			fmt.Sprintf(common.SparkKubernetesExecutorLabelTemplate, common.LabelSubmissionID):
+			continue
 		}
+		args = append(args, "--conf", fmt.Sprintf("%s=%s", key, value))
 	}
 	return args, nil
 }
@@ -295,6 +323,9 @@ func nodeSelectorOption(app *v1beta2.SparkApplication) ([]string, error) {
 	return args, nil
 }
 
+// driverConfOption builds driver settings and stamps the application UID, spec
+// generation and submission ID. These identify the run even without a webhook;
+// user labels and annotations cannot replace those reserved values.
 func driverConfOption(app *v1beta2.SparkApplication) ([]string, error) {
 	var args []string
 	var property string
@@ -313,6 +344,10 @@ func driverConfOption(app *v1beta2.SparkApplication) ([]string, error) {
 
 	property = fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, common.LabelSubmissionID)
 	args = append(args, "--conf", fmt.Sprintf("%s=%s", property, app.Status.SubmissionID))
+	property = fmt.Sprintf(common.SparkKubernetesDriverAnnotationTemplate, common.AnnotationAppUID)
+	args = append(args, "--conf", fmt.Sprintf("%s=%s", property, app.UID))
+	property = fmt.Sprintf(common.SparkKubernetesDriverAnnotationTemplate, common.AnnotationAppGeneration)
+	args = append(args, "--conf", fmt.Sprintf("%s=%d", property, app.Generation))
 
 	if app.Spec.Driver.Image != nil && *app.Spec.Driver.Image != "" {
 		args = append(args, "--conf",
@@ -368,16 +403,25 @@ func driverConfOption(app *v1beta2.SparkApplication) ([]string, error) {
 
 	// Populate SparkApplication labels to driver pod
 	for key, value := range app.Labels {
+		if key == common.LabelSparkAppName || key == common.LabelSubmissionID {
+			continue
+		}
 		property = fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, key)
 		args = append(args, "--conf", fmt.Sprintf("%s=%s", property, value))
 	}
 
 	for key, value := range app.Spec.Driver.Labels {
+		if key == common.LabelSparkAppName || key == common.LabelSubmissionID {
+			continue
+		}
 		property = fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, key)
 		args = append(args, "--conf", fmt.Sprintf("%s=%s", property, value))
 	}
 
 	for key, value := range app.Spec.Driver.Annotations {
+		if key == common.AnnotationAppUID || key == common.AnnotationAppGeneration {
+			continue
+		}
 		property = fmt.Sprintf(common.SparkKubernetesDriverAnnotationTemplate, key)
 		args = append(args, "--conf", fmt.Sprintf("%s=%s", property, value))
 	}
@@ -646,6 +690,8 @@ func driverEnvOption(app *v1beta2.SparkApplication) ([]string, error) {
 	return args, nil
 }
 
+// executorConfOption builds executor settings while preserving the application
+// and submission labels used to associate pod events with the current run.
 func executorConfOption(app *v1beta2.SparkApplication) ([]string, error) {
 	var args []string
 	var property string
@@ -714,10 +760,16 @@ func executorConfOption(app *v1beta2.SparkApplication) ([]string, error) {
 
 	// Populate SparkApplication labels to executor pod
 	for key, value := range app.Labels {
+		if key == common.LabelSparkAppName || key == common.LabelSubmissionID {
+			continue
+		}
 		property := fmt.Sprintf(common.SparkKubernetesExecutorLabelTemplate, key)
 		args = append(args, "--conf", fmt.Sprintf("%s=%s", property, value))
 	}
 	for key, value := range app.Spec.Executor.Labels {
+		if key == common.LabelSparkAppName || key == common.LabelSubmissionID {
+			continue
+		}
 		property := fmt.Sprintf(common.SparkKubernetesExecutorLabelTemplate, key)
 		args = append(args, "--conf", fmt.Sprintf("%s=%s", property, value))
 	}
