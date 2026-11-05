@@ -107,6 +107,8 @@ var _ = Describe("submission recovery after process death", Serial, func() {
 	})
 })
 
+// TestSubmissionCrashHelper is the child-process entry point killed by the crash
+// scenario; ordinary test runs leave it inactive unless the helper environment is set.
 func TestSubmissionCrashHelper(t *testing.T) {
 	if os.Getenv("SPARK_OPERATOR_CRASH_HELPER") != "1" {
 		return
@@ -128,7 +130,7 @@ func TestSubmissionCrashHelper(t *testing.T) {
 	}
 	namespace := os.Getenv("SPARK_OPERATOR_TEST_NAMESPACE")
 	r := sparkapplication.NewReconciler(nil, scheme, c, record.NewFakeRecorder(100), nil, sparkapplication.Options{
-		APIReader: c, Namespaces: []string{namespace}, SparkSubmitTimeout: 20 * time.Second,
+		APIReader: c, Namespaces: []string{namespace}, SubmissionTimeout: 20 * time.Second,
 	})
 	_, err = r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{
 		Namespace: namespace,

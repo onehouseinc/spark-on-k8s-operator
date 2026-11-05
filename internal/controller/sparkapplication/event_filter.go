@@ -113,16 +113,21 @@ func (f *sparkPodEventFilter) filter(pod *corev1.Pod) bool {
 	return f.namespaces[metav1.NamespaceAll] || f.namespaces[pod.Namespace]
 }
 
-type EventFilter struct {
-	client     client.Client
+// SparkApplicationEventFilter limits events to managed namespaces and retires
+// the current run when its desired spec changes.
+type SparkApplicationEventFilter struct {
+	statusWriter client.Client
+	// apiReader bypasses the cache before deciding whether an event still applies.
 	apiReader  client.Reader
 	recorder   record.EventRecorder
 	namespaces map[string]bool
 }
 
-var _ predicate.Predicate = &EventFilter{}
+var _ predicate.Predicate = &SparkApplicationEventFilter{}
 
-func NewSparkApplicationEventFilter(client client.Client, apiReader client.Reader, recorder record.EventRecorder, namespaces []string) *EventFilter {
+// NewSparkApplicationEventFilter uses live reads for invalidation decisions and
+// the manager client for status writes. Watch objects are never mutated in place.
+func NewSparkApplicationEventFilter(writer client.Client, apiReader client.Reader, recorder record.EventRecorder, namespaces []string) *SparkApplicationEventFilter {
 	nsMap := make(map[string]bool)
 	if len(namespaces) == 0 {
 		nsMap[metav1.NamespaceAll] = true
@@ -132,16 +137,16 @@ func NewSparkApplicationEventFilter(client client.Client, apiReader client.Reade
 		}
 	}
 
-	return &EventFilter{
-		client:     client,
-		apiReader:  apiReader,
-		recorder:   recorder,
-		namespaces: nsMap,
+	return &SparkApplicationEventFilter{
+		statusWriter: writer,
+		apiReader:    apiReader,
+		recorder:     recorder,
+		namespaces:   nsMap,
 	}
 }
 
 // Create implements predicate.Predicate.
-func (f *EventFilter) Create(e event.CreateEvent) bool {
+func (f *SparkApplicationEventFilter) Create(e event.CreateEvent) bool {
 	app, ok := e.Object.(*v1beta2.SparkApplication)
 	if !ok {
 		return false
@@ -150,8 +155,10 @@ func (f *EventFilter) Create(e event.CreateEvent) bool {
 	return f.filter(app)
 }
 
-// Update implements predicate.Predicate.
-func (f *EventFilter) Update(e event.UpdateEvent) bool {
+// Update enqueues changes and marks a changed spec INVALIDATING only if the event
+// still describes the live application and submission. Failed invalidation writes
+// still enqueue reconciliation so stamped drivers can expose a spec mismatch.
+func (f *SparkApplicationEventFilter) Update(e event.UpdateEvent) bool {
 	oldApp, ok := e.ObjectOld.(*v1beta2.SparkApplication)
 	if !ok {
 		return false
@@ -183,7 +190,7 @@ func (f *EventFilter) Update(e event.UpdateEvent) bool {
 				return nil
 			}
 			latest.Status.AppState.State = v1beta2.ApplicationStateInvalidating
-			return f.client.Status().Update(context.TODO(), latest)
+			return f.statusWriter.Status().Update(context.TODO(), latest)
 		})
 		if err != nil {
 			logger.Error(err, "Failed to update application status", "application", newApp.Name)
@@ -202,7 +209,7 @@ func (f *EventFilter) Update(e event.UpdateEvent) bool {
 }
 
 // Delete implements predicate.Predicate.
-func (f *EventFilter) Delete(e event.DeleteEvent) bool {
+func (f *SparkApplicationEventFilter) Delete(e event.DeleteEvent) bool {
 	app, ok := e.Object.(*v1beta2.SparkApplication)
 	if !ok {
 		return false
@@ -212,7 +219,7 @@ func (f *EventFilter) Delete(e event.DeleteEvent) bool {
 }
 
 // Generic implements predicate.Predicate.
-func (f *EventFilter) Generic(e event.GenericEvent) bool {
+func (f *SparkApplicationEventFilter) Generic(e event.GenericEvent) bool {
 	app, ok := e.Object.(*v1beta2.SparkApplication)
 	if !ok {
 		return false
@@ -221,6 +228,6 @@ func (f *EventFilter) Generic(e event.GenericEvent) bool {
 	return f.filter(app)
 }
 
-func (f *EventFilter) filter(app *v1beta2.SparkApplication) bool {
+func (f *SparkApplicationEventFilter) filter(app *v1beta2.SparkApplication) bool {
 	return f.namespaces[metav1.NamespaceAll] || f.namespaces[app.Namespace]
 }

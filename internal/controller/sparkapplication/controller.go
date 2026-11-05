@@ -28,7 +28,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -52,10 +51,18 @@ var (
 	logger = log.Log.WithName("")
 )
 
+// DefaultSubmissionTimeout sets the budget measured from recorded submission
+// intent. Preparation consumes this budget before spark-submit can start.
+const DefaultSubmissionTimeout = 10 * time.Minute
+
 // Options defines the options of the controller.
 type Options struct {
-	APIReader             client.Reader
-	SparkSubmitTimeout    time.Duration
+	// APIReader bypasses the informer cache for decisions to submit, recover or
+	// delete resources. The regular client still handles writes and executor lists.
+	APIReader client.Reader
+	// SubmissionTimeout is measured from LastSubmissionAttemptTime, not process
+	// launch. All controller replicas must use the same value during handoff.
+	SubmissionTimeout     time.Duration
 	Namespaces            []string
 	EnableUIService       bool
 	IngressClassName      string
@@ -72,7 +79,8 @@ type Options struct {
 	MaxTrackedExecutorPerApp int
 }
 
-// Reconciler reconciles a SparkApplication object.
+// Reconciler advances SparkApplications through submission, execution and cleanup.
+// Submission recovery uses live reads while executor tracking uses the cache.
 type Reconciler struct {
 	manager  ctrl.Manager
 	scheme   *runtime.Scheme
@@ -85,7 +93,8 @@ type Reconciler struct {
 // Reconciler implements reconcile.Reconciler.
 var _ reconcile.Reconciler = &Reconciler{}
 
-// NewReconciler creates a new Reconciler instance.
+// NewReconciler creates the SparkApplication controller. A zero SubmissionTimeout
+// selects the default; callers must supply an uncached APIReader.
 func NewReconciler(
 	manager ctrl.Manager,
 	scheme *runtime.Scheme,
@@ -94,8 +103,8 @@ func NewReconciler(
 	registry *scheduler.Registry,
 	options Options,
 ) *Reconciler {
-	if options.SparkSubmitTimeout == 0 {
-		options.SparkSubmitTimeout = 10 * time.Minute
+	if options.SubmissionTimeout == 0 {
+		options.SubmissionTimeout = DefaultSubmissionTimeout
 	}
 	return &Reconciler{
 		manager:  manager,
@@ -167,9 +176,11 @@ func NewReconciler(
 // |                                             +-------------------------------+                                      |
 // |                                                                                                                    |
 // +--------------------------------------------------------------------------------------------------------------------+
+// Reconcile dispatches using the current API-server state. Each handler reads it
+// again before writing so a status conflict can retry against a fresh version.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
-	app, err := r.getSparkApplication(ctx, key)
+	app, err := r.getSparkApplicationFromAPI(ctx, key)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return ctrl.Result{}, nil
@@ -235,9 +246,11 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, options controller.Optio
 		Complete(r)
 }
 
+// handleSparkApplicationDeletion removes only resources whose ownership matches
+// this application incarnation; same-name resources from another app are retained.
 func (r *Reconciler) handleSparkApplicationDeletion(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
-	app, err := r.getSparkApplication(ctx, key)
+	app, err := r.getSparkApplicationFromAPI(ctx, key)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return ctrl.Result{}, nil
@@ -245,23 +258,27 @@ func (r *Reconciler) handleSparkApplicationDeletion(ctx context.Context, req ctr
 		return ctrl.Result{Requeue: true}, err
 	}
 
-	if err := r.deleteSparkResources(ctx, app); err != nil {
+	if err := r.deleteSubmissionResources(ctx, app); err != nil {
 		logger.Error(err, "Failed to delete resources associated with SparkApplication", "name", app.Name, "namespace", app.Namespace)
 		return ctrl.Result{Requeue: true}, err
 	}
 	return ctrl.Result{}, nil
 }
 
+// reconcileNewSparkApplication starts the first attempt or recovers one whose
+// intent was saved before the operator stopped.
 func (r *Reconciler) reconcileNewSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	return r.reconcileSubmission(ctx, req, v1beta2.ApplicationStateNew)
+	return r.reconcileSubmissionAttempt(ctx, req, v1beta2.ApplicationStateNew)
 }
 
+// reconcileSubmittedSparkApplication follows the submitted driver's state. The
+// timed recheck preserves progress when a pod event is delayed or filtered.
 func (r *Reconciler) reconcileSubmittedSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
-			old, err := r.getSparkApplication(ctx, key)
+			old, err := r.getSparkApplicationFromAPI(ctx, key)
 			if err != nil {
 				return err
 			}
@@ -283,19 +300,23 @@ func (r *Reconciler) reconcileSubmittedSparkApplication(ctx context.Context, req
 		logger.Error(retryErr, "Failed to reconcile SparkApplication", "name", key.Name, "namespace", key.Namespace)
 		return ctrl.Result{}, retryErr
 	}
-	return ctrl.Result{RequeueAfter: activeRecheckInterval}, nil
+	return ctrl.Result{RequeueAfter: activeApplicationRecheckInterval}, nil
 }
 
+// reconcileFailedSubmissionSparkApplication checks for a recoverable driver
+// before applying the submission retry policy and backoff.
 func (r *Reconciler) reconcileFailedSubmissionSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	return r.reconcileSubmission(ctx, req, v1beta2.ApplicationStateFailedSubmission)
+	return r.reconcileSubmissionAttempt(ctx, req, v1beta2.ApplicationStateFailedSubmission)
 }
 
+// reconcileRunningSparkApplication refreshes driver and executor status, with a
+// periodic recheck in case the current driver's events never reach the queue.
 func (r *Reconciler) reconcileRunningSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
-			old, err := r.getSparkApplication(ctx, key)
+			old, err := r.getSparkApplicationFromAPI(ctx, key)
 			if err != nil {
 				return err
 			}
@@ -319,19 +340,24 @@ func (r *Reconciler) reconcileRunningSparkApplication(ctx context.Context, req c
 		logger.Error(retryErr, "Failed to reconcile SparkApplication", "name", key.Name, "namespace", key.Namespace)
 		return ctrl.Result{}, retryErr
 	}
-	return ctrl.Result{RequeueAfter: activeRecheckInterval}, nil
+	return ctrl.Result{RequeueAfter: activeApplicationRecheckInterval}, nil
 }
 
+// reconcilePendingRerunSparkApplication finishes old-run cleanup before starting
+// a replacement, or recovers an already recorded replacement attempt.
 func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	return r.reconcileSubmission(ctx, req, v1beta2.ApplicationStatePendingRerun)
+	return r.reconcileSubmissionAttempt(ctx, req, v1beta2.ApplicationStatePendingRerun)
 }
 
+// reconcileInvalidatingSparkApplication retires a run after a spec change. It
+// clears the active-attempt marker while retaining the old ID and resource names
+// so PENDING_RERUN can finish cleanup without adopting the retiring driver.
 func (r *Reconciler) reconcileInvalidatingSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
-			old, err := r.getSparkApplication(ctx, key)
+			old, err := r.getSparkApplicationFromAPI(ctx, key)
 			if err != nil {
 				return err
 			}
@@ -341,7 +367,7 @@ func (r *Reconciler) reconcileInvalidatingSparkApplication(ctx context.Context, 
 			app := old.DeepCopy()
 
 			// Invalidate the current run and enqueue the SparkApplication for re-execution.
-			if err := r.deleteSparkResources(ctx, app); err != nil {
+			if err := r.deleteSubmissionResources(ctx, app); err != nil {
 				return err
 			} else {
 				r.resetSparkApplicationStatus(app)
@@ -360,12 +386,14 @@ func (r *Reconciler) reconcileInvalidatingSparkApplication(ctx context.Context, 
 	return ctrl.Result{RequeueAfter: submissionRecheckInterval}, nil
 }
 
+// reconcileSucceedingSparkApplication either finishes the application or starts
+// cleanup for RestartPolicy Always; the next attempt waits for resources to vanish.
 func (r *Reconciler) reconcileSucceedingSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
-			old, err := r.getSparkApplication(ctx, key)
+			old, err := r.getSparkApplicationFromAPI(ctx, key)
 			if err != nil {
 				return err
 			}
@@ -375,7 +403,7 @@ func (r *Reconciler) reconcileSucceedingSparkApplication(ctx context.Context, re
 			app := old.DeepCopy()
 
 			if util.ShouldRetry(app) {
-				if err := r.deleteSparkResources(ctx, app); err != nil {
+				if err := r.deleteSubmissionResources(ctx, app); err != nil {
 					logger.Error(err, "failed to delete spark resources", "name", app.Name, "namespace", app.Namespace)
 					return err
 				}
@@ -396,6 +424,8 @@ func (r *Reconciler) reconcileSucceedingSparkApplication(ctx context.Context, re
 	return ctrl.Result{RequeueAfter: submissionRecheckInterval}, nil
 }
 
+// reconcileFailingSparkApplication applies execution retry limits and backoff.
+// Cleanup failures and delayed deletion must not leave the rerun without a retry.
 func (r *Reconciler) reconcileFailingSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
 
@@ -404,7 +434,7 @@ func (r *Reconciler) reconcileFailingSparkApplication(ctx context.Context, req c
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
-			old, err := r.getSparkApplication(ctx, key)
+			old, err := r.getSparkApplicationFromAPI(ctx, key)
 			if err != nil {
 				return err
 			}
@@ -419,7 +449,7 @@ func (r *Reconciler) reconcileFailingSparkApplication(ctx context.Context, req c
 					return err
 				}
 				if timeUntilNextRetryDue <= 0 {
-					if err := r.deleteSparkResources(ctx, app); err != nil {
+					if err := r.deleteSubmissionResources(ctx, app); err != nil {
 						logger.Error(err, "failed to delete spark resources", "name", app.Name, "namespace", app.Namespace)
 						return err
 					}
@@ -452,9 +482,11 @@ func (r *Reconciler) reconcileFailedSparkApplication(ctx context.Context, req ct
 	return r.reconcileTerminatedSparkApplication(ctx, req)
 }
 
+// reconcileTerminatedSparkApplication performs final bookkeeping and optional
+// TTL deletion. The UID precondition protects a replacement with the same name.
 func (r *Reconciler) reconcileTerminatedSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
-	old, err := r.getSparkApplication(ctx, key)
+	old, err := r.getSparkApplicationFromAPI(ctx, key)
 	if err != nil {
 		return ctrl.Result{Requeue: true}, err
 	}
@@ -503,12 +535,14 @@ func (r *Reconciler) reconcileTerminatedSparkApplication(ctx context.Context, re
 	return ctrl.Result{RequeueAfter: ttl - survival}, nil
 }
 
+// reconcileUnknownSparkApplication re-inspects the driver until its state is
+// known, even when no further pod event arrives.
 func (r *Reconciler) reconcileUnknownSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
-			old, err := r.getSparkApplication(ctx, key)
+			old, err := r.getSparkApplicationFromAPI(ctx, key)
 			if err != nil {
 				return err
 			}
@@ -530,19 +564,13 @@ func (r *Reconciler) reconcileUnknownSparkApplication(ctx context.Context, req c
 		logger.Error(retryErr, "Failed to reconcile SparkApplication", "name", key.Name, "namespace", key.Namespace)
 		return ctrl.Result{}, retryErr
 	}
-	return ctrl.Result{RequeueAfter: activeRecheckInterval}, nil
+	return ctrl.Result{RequeueAfter: activeApplicationRecheckInterval}, nil
 }
 
-// getSparkApplication gets the SparkApplication with the given name and namespace.
-func (r *Reconciler) getSparkApplication(ctx context.Context, key types.NamespacedName) (*v1beta2.SparkApplication, error) {
-	app := &v1beta2.SparkApplication{}
-	if err := r.options.APIReader.Get(ctx, key, app); err != nil {
-		return nil, err
-	}
-	return app, nil
-}
-
-func (r *Reconciler) runSubmission(app *v1beta2.SparkApplication) error {
+// prepareAndRunSparkSubmit creates submission resources and runs spark-submit
+// once. Its caller must persist the attempt identity first; this method must not
+// be replayed merely because saving the outcome conflicts.
+func (r *Reconciler) prepareAndRunSparkSubmit(app *v1beta2.SparkApplication) error {
 	if util.PrometheusMonitoringEnabled(app) {
 		logger.Info("Configure Prometheus monitoring for SparkApplication", "name", app.Name, "namespace", app.Namespace)
 		if err := configPrometheusMonitoring(app, r.client); err != nil {
@@ -628,28 +656,31 @@ func (r *Reconciler) runSubmission(app *v1beta2.SparkApplication) error {
 
 	// Try submitting the application by running spark-submit.
 	logger.Info("Running spark-submit for SparkApplication", "name", app.Name, "namespace", app.Namespace, "arguments", sparkSubmitArgs)
-	if err := runSparkSubmit(newSubmission(sparkSubmitArgs, app), r.options.SparkSubmitTimeout); err != nil {
+	if err := runSparkSubmit(newSparkSubmitCommand(sparkSubmitArgs, app), r.options.SubmissionTimeout); err != nil {
 		r.recordSparkApplicationEvent(app)
 		return fmt.Errorf("failed to run spark-submit: %v", err)
 	}
 	return nil
 }
 
-// updateDriverState finds the driver pod of the application
-// and updates the driver state based on the current phase of the pod.
+// updateDriverState derives application status from a live driver read after
+// checking ownership, spec generation and submission identity. It updates only
+// the in-memory app; the caller persists it with resource-version protection.
 func (r *Reconciler) updateDriverState(ctx context.Context, app *v1beta2.SparkApplication) error {
 	// Either the driver pod doesn't exist yet or its name has not been updated.
 	if app.Status.DriverInfo.PodName == "" {
 		return fmt.Errorf("empty driver pod name with application state %s", app.Status.AppState.State)
 	}
 
-	driverPod, err := r.getDriverPod(ctx, app)
+	driverPod, err := r.getDriverPodFromAPI(ctx, app)
 	if err != nil {
 		return err
 	}
 
 	if driverPod == nil {
 		if app.Status.AppState.State != v1beta2.ApplicationStateSubmitted || metav1.Now().Sub(app.Status.LastSubmissionAttemptTime.Time) > r.options.DriverPodCreationGracePeriod {
+			glog.Warningf("Expected driver pod %s/%s was not found for SparkApplication %s (state=%s, submissionID=%s)",
+				app.Namespace, app.Status.DriverInfo.PodName, app.Name, app.Status.AppState.State, app.Status.SubmissionID)
 			app.Status.AppState.State = v1beta2.ApplicationStateFailing
 			app.Status.AppState.ErrorMessage = "driver pod not found"
 			app.Status.TerminationTime = metav1.Now()
@@ -658,10 +689,10 @@ func (r *Reconciler) updateDriverState(ctx context.Context, app *v1beta2.SparkAp
 		return fmt.Errorf("driver pod not found, while inside the grace period. Grace period of %v expires at %v", r.options.DriverPodCreationGracePeriod, app.Status.LastSubmissionAttemptTime.Add(r.options.DriverPodCreationGracePeriod))
 	}
 
-	if !resourceBelongsToApp(app, driverPod) {
+	if !isResourceOwnedByApplication(app, driverPod) {
 		return fmt.Errorf("driver pod %s does not belong to SparkApplication %s", driverPod.Name, app.Name)
 	}
-	if driverGenerationChanged(app, driverPod) {
+	if driverHasDifferentSpecGeneration(app, driverPod) {
 		app.Status.AppState = v1beta2.ApplicationState{State: v1beta2.ApplicationStateInvalidating}
 		return nil
 	}
@@ -784,21 +815,8 @@ func (r *Reconciler) getExecutorPods(app *v1beta2.SparkApplication) (*corev1.Pod
 	return pods, nil
 }
 
-func (r *Reconciler) getDriverPod(ctx context.Context, app *v1beta2.SparkApplication) (*corev1.Pod, error) {
-	name := app.Status.DriverInfo.PodName
-	if name == "" {
-		name = util.GetDriverPodName(app)
-	}
-	pod := &corev1.Pod{}
-	if err := r.options.APIReader.Get(ctx, types.NamespacedName{Namespace: app.Namespace, Name: name}, pod); err != nil {
-		if errors.IsNotFound(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return pod, nil
-}
-
+// updateSparkApplicationState refreshes driver and executor status in memory.
+// A read error leaves persistence to the caller's retry instead of guessing state.
 func (r *Reconciler) updateSparkApplicationState(ctx context.Context, app *v1beta2.SparkApplication) error {
 	if err := r.updateDriverState(ctx, app); err != nil {
 		return err
@@ -811,10 +829,10 @@ func (r *Reconciler) updateSparkApplicationState(ctx context.Context, app *v1bet
 	return nil
 }
 
-// updateSparkApplicationStatus updates the status of the SparkApplication.
+// updateSparkApplicationStatus persists status against the app's resourceVersion.
+// It returns conflicts to the caller; it never retries submission side effects.
 func (r *Reconciler) updateSparkApplicationStatus(ctx context.Context, app *v1beta2.SparkApplication) error {
 	if err := r.client.Status().Update(ctx, app); err != nil {
-		// Log failure with details
 		logger.Error(err, "FAILED to update SparkApplication status",
 			"name", app.Name,
 			"namespace", app.Namespace,
@@ -824,7 +842,6 @@ func (r *Reconciler) updateSparkApplicationStatus(ctx context.Context, app *v1be
 			"errorType", fmt.Sprintf("%T", err))
 		return err
 	}
-	// Log before status update
 	logger.Info("Updated SparkApplication status to API server",
 		"name", app.Name,
 		"namespace", app.Namespace,
@@ -921,6 +938,9 @@ func (r *Reconciler) recordExecutorEvent(app *v1beta2.SparkApplication, state v1
 	}
 }
 
+// resetSparkApplicationStatus retires the current attempt during invalidation or
+// prepares a rerun. Invalidation preserves resource names for cleanup and clears
+// the attempt time so a matching old submission ID cannot trigger recovery.
 func (r *Reconciler) resetSparkApplicationStatus(app *v1beta2.SparkApplication) {
 	status := &app.Status
 	switch status.AppState.State {

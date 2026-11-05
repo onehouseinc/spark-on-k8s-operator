@@ -50,7 +50,7 @@ var _ = Describe("submission failure after driver creation", Serial, func() {
 		writer := observeSubmissionFailure(&publishedFailure)
 		options := sparkapplication.Options{APIReader: k8sClient, Namespaces: []string{"default"}}
 		if timeout {
-			options.SparkSubmitTimeout = 5 * time.Second
+			options.SubmissionTimeout = 5 * time.Second
 		}
 		r := sparkapplication.NewReconciler(nil, k8sClient.Scheme(), writer, record.NewFakeRecorder(100), nil, options)
 		done := startRecoveryReconcile(r, app, submit)
@@ -207,6 +207,8 @@ var _ = Describe("submission failure after driver creation", Serial, func() {
 
 })
 
+// failControlledSubmit makes the fake process fail after its barrier releases,
+// allowing the test to create a usable driver before Spark reports failure.
 func failControlledSubmit(submit *controlledSubmit) {
 	path := filepath.Join(submit.dir, "bin", "spark-submit")
 	script, err := os.ReadFile(path)
@@ -215,6 +217,8 @@ func failControlledSubmit(submit *controlledSubmit) {
 	Expect(os.WriteFile(path, script, 0o755)).To(Succeed())
 }
 
+// observeSubmissionFailure detects any attempt to publish failure, including a
+// transient failure that a later recovery update would hide from a final-state check.
 func observeSubmissionFailure(failed *atomic.Bool) client.Client {
 	return recoveryIntercept(interceptor.Funcs{
 		SubResourceUpdate: func(ctx context.Context, c client.Client, subresource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {

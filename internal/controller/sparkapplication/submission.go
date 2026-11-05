@@ -30,33 +30,40 @@ import (
 	"github.com/kubeflow/spark-operator/pkg/util"
 )
 
-// submission includes information of a Spark application to be submitted.
-type submission struct {
-	namespace string
-	name      string
-	args      []string
-	startTime time.Time
+// sparkSubmitCommand binds process arguments to the already recorded attempt.
+// Its deadline starts at that attempt's timestamp, including preparation time.
+type sparkSubmitCommand struct {
+	namespace        string
+	name             string
+	args             []string
+	attemptStartTime time.Time
 }
 
-func newSubmission(args []string, app *v1beta2.SparkApplication) *submission {
-	return &submission{
-		namespace: app.Namespace,
-		name:      app.Name,
-		args:      args,
-		startTime: app.Status.LastSubmissionAttemptTime.Time,
+// newSparkSubmitCommand carries the persisted attempt time into process execution
+// so a restart and the original submitter agree on when the attempt expires.
+func newSparkSubmitCommand(args []string, app *v1beta2.SparkApplication) *sparkSubmitCommand {
+	return &sparkSubmitCommand{
+		namespace:        app.Namespace,
+		name:             app.Name,
+		args:             args,
+		attemptStartTime: app.Status.LastSubmissionAttemptTime.Time,
 	}
 }
 
-func runSparkSubmit(submission *submission, timeout time.Duration) error {
+// runSparkSubmit runs one process within the recorded attempt's deadline. It is
+// independent of reconcile cancellation so leadership handoff does not interrupt
+// an otherwise viable submit; recovery uses live resources to interpret failures.
+func runSparkSubmit(submitCommand *sparkSubmitCommand, timeout time.Duration) error {
 	sparkHome, present := os.LookupEnv(common.EnvSparkHome)
 	if !present {
 		return fmt.Errorf("env %s is not specified", common.EnvSparkHome)
 	}
 	command := filepath.Join(sparkHome, "bin", "spark-submit")
 	// Preparation and process execution share the deadline used by recovery.
-	ctx, cancel := context.WithDeadline(context.Background(), submission.startTime.Add(timeout))
+	ctx, cancel := context.WithDeadline(context.Background(), submitCommand.attemptStartTime.Add(timeout))
 	defer cancel()
-	cmd := exec.CommandContext(ctx, command, submission.args...)
+	cmd := exec.CommandContext(ctx, command, submitCommand.args...)
+	// Bound waiting for inherited output pipes after the process exits or is killed.
 	cmd.WaitDelay = time.Second
 	_, err := cmd.Output()
 	if err != nil {
@@ -270,6 +277,9 @@ func submissionWaitAppCompletionOption(_ *v1beta2.SparkApplication) ([]string, e
 	return args, nil
 }
 
+// sparkConfOption passes through user settings except controller-owned identity
+// and submission-lifetime settings. Overrides could hide the driver from recovery
+// or keep spark-submit waiting for the entire application to finish.
 func sparkConfOption(app *v1beta2.SparkApplication) ([]string, error) {
 	if app.Spec.SparkConf == nil {
 		return nil, nil
@@ -313,6 +323,9 @@ func nodeSelectorOption(app *v1beta2.SparkApplication) ([]string, error) {
 	return args, nil
 }
 
+// driverConfOption builds driver settings and stamps the application UID, spec
+// generation and submission ID. These identify the run even without a webhook;
+// user labels and annotations cannot replace those reserved values.
 func driverConfOption(app *v1beta2.SparkApplication) ([]string, error) {
 	var args []string
 	var property string
@@ -677,6 +690,8 @@ func driverEnvOption(app *v1beta2.SparkApplication) ([]string, error) {
 	return args, nil
 }
 
+// executorConfOption builds executor settings while preserving the application
+// and submission labels used to associate pod events with the current run.
 func executorConfOption(app *v1beta2.SparkApplication) ([]string, error) {
 	var args []string
 	var property string

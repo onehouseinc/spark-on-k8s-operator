@@ -70,10 +70,10 @@ func TestSubmissionDeadlineIncludesPreparation(t *testing.T) {
 		},
 	})
 	r := NewReconciler(nil, scheme, slow, record.NewFakeRecorder(10), nil, Options{
-		APIReader: c, EnableUIService: true, SparkSubmitTimeout: timeout,
+		APIReader: c, EnableUIService: true, SubmissionTimeout: timeout,
 	})
 
-	err := r.runSubmission(app)
+	err := r.prepareAndRunSparkSubmit(app)
 
 	require.True(t, prepared)
 	require.ErrorContains(t, err, "spark-submit timed out after 5s")

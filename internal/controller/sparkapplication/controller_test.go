@@ -974,6 +974,8 @@ func getDriverNamespacedName(appName string, appNamespace string) types.Namespac
 	}
 }
 
+// createDriverPod builds a driver fixture and emulates the webhook's owner reference
+// when the application exists; callers control when the pod and its status are saved.
 func createDriverPod(appName string, appNamespace string) *corev1.Pod {
 	namespacedName := getDriverNamespacedName(appName, appNamespace)
 	pod := &corev1.Pod{

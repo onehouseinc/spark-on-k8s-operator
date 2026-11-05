@@ -31,7 +31,41 @@ import (
 	"github.com/kubeflow/spark-operator/pkg/util"
 )
 
-func (r *Reconciler) getSparkResources(ctx context.Context, app *v1beta2.SparkApplication) ([]client.Object, error) {
+// getSparkApplicationFromAPI bypasses the informer cache so intent checks and
+// status-conflict retries use the latest persisted state. Re-reading a stale
+// cache entry could repeat submission or exhaust retries without seeing a write.
+func (r *Reconciler) getSparkApplicationFromAPI(ctx context.Context, key client.ObjectKey) (*v1beta2.SparkApplication, error) {
+	app := &v1beta2.SparkApplication{}
+	if err := r.options.APIReader.Get(ctx, key, app); err != nil {
+		return nil, err
+	}
+	return app, nil
+}
+
+// getDriverPodFromAPI reads the recorded driver name, falling back to the name
+// derived from the spec when status is incomplete. A nil pod without an error
+// means NotFound; API failures must not be treated as permission to submit again.
+// The caller decides whether absence is expected or warrants a warning.
+func (r *Reconciler) getDriverPodFromAPI(ctx context.Context, app *v1beta2.SparkApplication) (*corev1.Pod, error) {
+	name := app.Status.DriverInfo.PodName
+	if name == "" {
+		name = util.GetDriverPodName(app)
+	}
+	pod := &corev1.Pod{}
+	if err := r.options.APIReader.Get(ctx, client.ObjectKey{Namespace: app.Namespace, Name: name}, pod); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return pod, nil
+}
+
+// getSubmissionResourcesFromAPI reads the driver and operator-managed UI
+// resources that must disappear before another attempt. Recorded names survive
+// invalidation; derived names cover a crash before older operators saved them.
+// Live reads include resources that the cache has not observed or does not watch.
+func (r *Reconciler) getSubmissionResourcesFromAPI(ctx context.Context, app *v1beta2.SparkApplication) ([]client.Object, error) {
 	driverName := app.Status.DriverInfo.PodName
 	if driverName == "" {
 		driverName = util.GetDriverPodName(app)
@@ -69,17 +103,23 @@ func (r *Reconciler) getSparkResources(ctx context.Context, app *v1beta2.SparkAp
 	return existing, nil
 }
 
-func (r *Reconciler) deleteSparkResources(ctx context.Context, app *v1beta2.SparkApplication) error {
-	objects, err := r.getSparkResources(ctx, app)
+// deleteSubmissionResources reads and requests deletion of the driver and UI
+// resources. A successful request does not mean deletion has finished; the next
+// submission must confirm their absence before allocating a replacement ID.
+func (r *Reconciler) deleteSubmissionResources(ctx context.Context, app *v1beta2.SparkApplication) error {
+	objects, err := r.getSubmissionResourcesFromAPI(ctx, app)
 	if err != nil {
 		return err
 	}
-	return r.deleteObservedResources(ctx, app, objects)
+	return r.deleteObservedSubmissionResources(ctx, app, objects)
 }
 
-func (r *Reconciler) deleteObservedResources(ctx context.Context, app *v1beta2.SparkApplication, objects []client.Object) error {
+// deleteObservedSubmissionResources deletes only the owned object versions that
+// were read. UID and resourceVersion preconditions prevent deleting a replacement
+// or a resource whose ownership changed between inspection and deletion.
+func (r *Reconciler) deleteObservedSubmissionResources(ctx context.Context, app *v1beta2.SparkApplication, objects []client.Object) error {
 	for _, object := range objects {
-		if !resourceBelongsToApp(app, object) {
+		if !isResourceOwnedByApplication(app, object) {
 			return fmt.Errorf("resource %s/%s does not belong to SparkApplication %s", object.GetNamespace(), object.GetName(), app.Name)
 		}
 		if !object.GetDeletionTimestamp().IsZero() {

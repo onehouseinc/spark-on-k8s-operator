@@ -142,6 +142,8 @@ func TestSpecUpdateIgnoresSupersededEvents(t *testing.T) {
 	}
 }
 
+// specUpdateApplications models a CPU-limit update while the recorded run stays the
+// same, letting tests distinguish spec changes from a replacement application or run.
 func specUpdateApplications() (*v1beta2.SparkApplication, *v1beta2.SparkApplication) {
 	app := &v1beta2.SparkApplication{
 		ObjectMeta: metav1.ObjectMeta{Name: "spec-update", Namespace: "default", UID: "app-uid", Generation: 2, ResourceVersion: "2"},
@@ -155,6 +157,7 @@ func specUpdateApplications() (*v1beta2.SparkApplication, *v1beta2.SparkApplicat
 	return oldApp, app
 }
 
+// specUpdateClient keeps status writes separate from spec updates, as the CRD does.
 func specUpdateClient(t *testing.T, app *v1beta2.SparkApplication) client.WithWatch {
 	t.Helper()
 	scheme := runtime.NewScheme()

@@ -149,11 +149,15 @@ while [ ! -f "$dir/release" ] && [ ! -f "$SPARK_HOME/release-all" ]; do sleep 0.
 	})
 })
 
+// recoveryManager exposes shutdown completion so tests restart the controller only
+// after the preceding manager and its reconcile workers have stopped.
 type recoveryManager struct {
 	cancel context.CancelFunc
 	done   chan error
 }
 
+// startRecoveryManager exercises informer delivery and the controller workqueue
+// against envtest, restricting watches to one application to isolate each restart.
 func startRecoveryManager(app *v1beta2.SparkApplication) *recoveryManager {
 	shutdown := 5 * time.Second
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
@@ -174,7 +178,7 @@ func startRecoveryManager(app *v1beta2.SparkApplication) *recoveryManager {
 		APIReader:                    mgr.GetAPIReader(),
 		Namespaces:                   []string{app.Namespace},
 		DriverPodCreationGracePeriod: time.Second,
-		SparkSubmitTimeout:           20 * time.Second,
+		SubmissionTimeout:            20 * time.Second,
 	})
 	Expect(r.SetupWithManager(mgr, controller.Options{MaxConcurrentReconciles: 1})).To(Succeed())
 	ctx, cancel := context.WithCancel(context.Background())
@@ -186,6 +190,8 @@ func startRecoveryManager(app *v1beta2.SparkApplication) *recoveryManager {
 	return manager
 }
 
+// createManagerDriver emulates a running driver with the process's recorded identity.
+// holdDeletion adds a finalizer so the test can observe cleanup waiting across restart.
 func createManagerDriver(app *v1beta2.SparkApplication, submit *controlledSubmit, holdDeletion bool) *corev1.Pod {
 	pod := createDriverPod(app.Name, app.Namespace)
 	pod.Labels[common.LabelSubmissionID] = submit.submissionID()

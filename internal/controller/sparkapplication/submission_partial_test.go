@@ -87,6 +87,8 @@ var _ = Describe("partial submission recovery", Serial, func() {
 	})
 })
 
+// newPartialSubmission models interruption between Spark creating its driver pod
+// and creating the ConfigMap the Pending driver needs to start.
 func newPartialSubmission() (*v1beta2.SparkApplication, *corev1.Pod) {
 	app := newRecoveryApplication(v1beta2.ApplicationStateNew)
 	app.Status.SubmissionID = "interrupted-run"

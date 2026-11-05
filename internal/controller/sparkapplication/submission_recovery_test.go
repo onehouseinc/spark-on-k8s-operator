@@ -327,10 +327,14 @@ var _ = Describe("submission recovery", Serial, func() {
 
 })
 
+// controlledSubmit records subprocess launches and can hold the first launch open
+// while a test creates a driver, changes the application, or injects an API failure.
 type controlledSubmit struct {
 	dir string
 }
 
+// newControlledSubmit installs a fake spark-submit; block keeps its first call at
+// a filesystem barrier until release is called, including across helper processes.
 func newControlledSubmit(block bool) *controlledSubmit {
 	dir := GinkgoT().TempDir()
 	Expect(os.Mkdir(filepath.Join(dir, "bin"), 0o755)).To(Succeed())
@@ -354,10 +358,12 @@ fi
 	return submit
 }
 
+// release lets the first submission return so the reconciler can save its outcome.
 func (s *controlledSubmit) release() {
 	Expect(os.WriteFile(filepath.Join(s.dir, "release"), nil, 0o644)).To(Succeed())
 }
 
+// waitForInvocation places test mutations after process launch but before its outcome.
 func (s *controlledSubmit) waitForInvocation() {
 	Eventually(func() error {
 		_, err := os.Stat(filepath.Join(s.dir, "entered"))
@@ -365,6 +371,7 @@ func (s *controlledSubmit) waitForInvocation() {
 	}, 10*time.Second).Should(Succeed())
 }
 
+// invocations counts actual process starts to detect duplicate submission side effects.
 func (s *controlledSubmit) invocations() int {
 	data, err := os.ReadFile(filepath.Join(s.dir, "calls"))
 	if os.IsNotExist(err) {
@@ -374,6 +381,7 @@ func (s *controlledSubmit) invocations() int {
 	return strings.Count(string(data), "call\n")
 }
 
+// conf reads a Spark configuration value from the first process's recorded arguments.
 func (s *controlledSubmit) conf(key string) string {
 	data, err := os.ReadFile(filepath.Join(s.dir, "args"))
 	Expect(err).NotTo(HaveOccurred())
@@ -385,17 +393,21 @@ func (s *controlledSubmit) conf(key string) string {
 	return ""
 }
 
+// submissionID reads the identity passed to Spark, independently of application status.
 func (s *controlledSubmit) submissionID() string {
 	id := s.conf(fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, common.LabelSubmissionID))
 	Expect(id).NotTo(BeEmpty())
 	return id
 }
 
+// recoveryResult carries the reconcile result back across the submission barrier.
 type recoveryResult struct {
 	result reconcile.Result
 	err    error
 }
 
+// startRecoveryReconcile runs reconciliation concurrently with test mutations and
+// releases the submit barrier during cleanup so a failed assertion cannot strand it.
 func startRecoveryReconcile(r *sparkapplication.Reconciler, app *v1beta2.SparkApplication, submit *controlledSubmit) <-chan recoveryResult {
 	done := make(chan recoveryResult, 1)
 	finished := make(chan struct{})
@@ -412,6 +424,8 @@ func startRecoveryReconcile(r *sparkapplication.Reconciler, app *v1beta2.SparkAp
 	return done
 }
 
+// newRecoveryReconciler allows write failures or cache lag on c while keeping
+// authoritative reads connected to the real envtest API server.
 func newRecoveryReconciler(c client.Client) *sparkapplication.Reconciler {
 	return sparkapplication.NewReconciler(nil, k8sClient.Scheme(), c, record.NewFakeRecorder(100), nil, sparkapplication.Options{
 		APIReader:                    k8sClient,
@@ -420,12 +434,16 @@ func newRecoveryReconciler(c client.Client) *sparkapplication.Reconciler {
 	})
 }
 
+// recoveryIntercept injects failures around a real API client, preserving server-side
+// resource versions and status updates instead of simulating them in memory.
 func recoveryIntercept(funcs interceptor.Funcs) client.Client {
 	c, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
 	Expect(err).NotTo(HaveOccurred())
 	return interceptor.NewClient(c, funcs)
 }
 
+// newRecoveryApplication creates an isolated application in the requested state;
+// failed-submission fixtures start with one prior attempt already due for retry.
 func newRecoveryApplication(state v1beta2.ApplicationStateType) *v1beta2.SparkApplication {
 	app := &v1beta2.SparkApplication{
 		ObjectMeta: metav1.ObjectMeta{GenerateName: "submission-recovery-", Namespace: "default"},
@@ -453,12 +471,16 @@ func newRecoveryApplication(state v1beta2.ApplicationStateType) *v1beta2.SparkAp
 	return app
 }
 
+// getRecoveryApplication reads persisted status directly, avoiding the reader whose
+// stale data or failures a test may have injected into the reconciler.
 func getRecoveryApplication(app *v1beta2.SparkApplication) *v1beta2.SparkApplication {
 	latest := &v1beta2.SparkApplication{}
 	Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(app), latest)).To(Succeed())
 	return latest
 }
 
+// createRecoveryDriver emulates Spark's driver creation using identity arguments
+// captured from the fake process, with the owner reference normally added by the webhook.
 func createRecoveryDriver(app *v1beta2.SparkApplication, submit *controlledSubmit) *corev1.Pod {
 	pod := createDriverPod(app.Name, app.Namespace)
 	pod.Labels[common.LabelSubmissionID] = submit.submissionID()
@@ -473,6 +495,8 @@ func createRecoveryDriver(app *v1beta2.SparkApplication, submit *controlledSubmi
 	return pod
 }
 
+// persistRecoveryDriver creates an owned, running driver without a kubelet; cleanup
+// removes any test finalizer because envtest has no controller to release it.
 func persistRecoveryDriver(app *v1beta2.SparkApplication, pod *corev1.Pod) {
 	pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(app, v1beta2.SchemeGroupVersion.WithKind("SparkApplication"))}
 	Expect(k8sClient.Create(context.Background(), pod)).To(Succeed())
