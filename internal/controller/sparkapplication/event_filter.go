@@ -117,7 +117,7 @@ func (f *sparkPodEventFilter) filter(pod *corev1.Pod) bool {
 // the current run when its desired spec changes.
 type SparkApplicationEventFilter struct {
 	statusWriter client.Client
-	// apiReader bypasses the cache before deciding whether an event still applies.
+	// apiReader refreshes the application only after a status-write conflict.
 	apiReader  client.Reader
 	recorder   record.EventRecorder
 	namespaces map[string]bool
@@ -125,8 +125,8 @@ type SparkApplicationEventFilter struct {
 
 var _ predicate.Predicate = &SparkApplicationEventFilter{}
 
-// NewSparkApplicationEventFilter uses live reads for invalidation decisions and
-// the manager client for status writes. Watch objects are never mutated in place.
+// NewSparkApplicationEventFilter uses the watch object for invalidation and live
+// reads only to retry conflicts. Watch objects are never mutated in place.
 func NewSparkApplicationEventFilter(writer client.Client, apiReader client.Reader, recorder record.EventRecorder, namespaces []string) *SparkApplicationEventFilter {
 	nsMap := make(map[string]bool)
 	if len(namespaces) == 0 {
@@ -178,11 +178,18 @@ func (f *SparkApplicationEventFilter) Update(e event.UpdateEvent) bool {
 	}
 
 	if !equality.Semantic.DeepEqual(oldApp.Spec, newApp.Spec) {
+		firstAttempt := true
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			latest := &v1beta2.SparkApplication{}
-			if err := f.apiReader.Get(context.TODO(), client.ObjectKeyFromObject(newApp), latest); err != nil {
-				return client.IgnoreNotFound(err)
+			// The event's resourceVersion protects the first write; only a conflict
+			// requires a live read to avoid retrying the same stale cache entry.
+			latest := newApp.DeepCopy()
+			if !firstAttempt {
+				latest = &v1beta2.SparkApplication{}
+				if err := f.apiReader.Get(context.TODO(), client.ObjectKeyFromObject(newApp), latest); err != nil {
+					return client.IgnoreNotFound(err)
+				}
 			}
+			firstAttempt = false
 			// A delayed event must not invalidate a replacement app or a newer submission.
 			if latest.UID != newApp.UID || latest.Generation != newApp.Generation ||
 				latest.Status.SubmissionID != newApp.Status.SubmissionID ||
@@ -190,7 +197,7 @@ func (f *SparkApplicationEventFilter) Update(e event.UpdateEvent) bool {
 				return nil
 			}
 			latest.Status.AppState.State = v1beta2.ApplicationStateInvalidating
-			return f.statusWriter.Status().Update(context.TODO(), latest)
+			return client.IgnoreNotFound(f.statusWriter.Status().Update(context.TODO(), latest))
 		})
 		if err != nil {
 			logger.Error(err, "Failed to update application status", "application", newApp.Name)

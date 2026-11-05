@@ -40,9 +40,17 @@ func TestSpecUpdateDoesNotMutateInformerObject(t *testing.T) {
 	oldApp, app := specUpdateApplications()
 	before := app.DeepCopy()
 	c := specUpdateClient(t, app)
-	filter := NewSparkApplicationEventFilter(c, c, record.NewFakeRecorder(10), nil)
+	apiReads := 0
+	reader := interceptor.NewClient(c, interceptor.Funcs{
+		Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			apiReads++
+			return underlying.Get(ctx, key, obj, opts...)
+		},
+	})
+	filter := NewSparkApplicationEventFilter(c, reader, record.NewFakeRecorder(10), nil)
 
 	require.True(t, filter.Update(event.UpdateEvent{ObjectOld: oldApp, ObjectNew: app}))
+	require.Zero(t, apiReads, "the watch event already contains the application")
 	require.Equal(t, before, app)
 	stored := &v1beta2.SparkApplication{}
 	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(app), stored))
@@ -70,9 +78,18 @@ func TestSpecUpdateRetriesMetadataConflict(t *testing.T) {
 			return underlying.SubResource(subresource).Update(ctx, obj, opts...)
 		},
 	})
-	filter := NewSparkApplicationEventFilter(writer, c, record.NewFakeRecorder(10), nil)
+	apiReads := 0
+	reader := interceptor.NewClient(c, interceptor.Funcs{
+		Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			apiReads++
+			return underlying.Get(ctx, key, obj, opts...)
+		},
+	})
+	filter := NewSparkApplicationEventFilter(writer, reader, record.NewFakeRecorder(10), nil)
 
 	require.True(t, filter.Update(event.UpdateEvent{ObjectOld: oldApp, ObjectNew: app}))
+	require.Equal(t, 1, apiReads, "only the conflicting write needs a fresh API read")
+	require.Equal(t, 2, updates)
 	stored := &v1beta2.SparkApplication{}
 	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(app), stored))
 	require.Equal(t, v1beta2.ApplicationStateInvalidating, stored.Status.AppState.State)
@@ -90,6 +107,17 @@ func TestSpecUpdateStillEnqueuesAfterWriteFailure(t *testing.T) {
 	filter := NewSparkApplicationEventFilter(writer, c, record.NewFakeRecorder(10), nil)
 
 	require.True(t, filter.Update(event.UpdateEvent{ObjectOld: oldApp, ObjectNew: app}))
+}
+
+func TestSpecUpdateIgnoresDeletedApplication(t *testing.T) {
+	oldApp, app := specUpdateApplications()
+	c := specUpdateClient(t, app)
+	require.NoError(t, c.Delete(context.Background(), app))
+	recorder := record.NewFakeRecorder(10)
+	filter := NewSparkApplicationEventFilter(c, c, recorder, nil)
+
+	require.True(t, filter.Update(event.UpdateEvent{ObjectOld: oldApp, ObjectNew: app}))
+	require.Empty(t, recorder.Events, "deletion is not an invalidation failure")
 }
 
 func TestSpecUpdateIgnoresSupersededEvents(t *testing.T) {
