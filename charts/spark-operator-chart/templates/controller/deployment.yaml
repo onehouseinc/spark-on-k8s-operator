@@ -103,6 +103,7 @@ spec:
         {{- if .Values.controller.driverPodCreationGracePeriod }}
         - --driver-pod-creation-grace-period={{ .Values.controller.driverPodCreationGracePeriod }}
         {{- end }}
+        - --submission-timeout={{ .Values.controller.submissionTimeout | default "10m" }}
         {{- if .Values.controller.maxTrackedExecutorPerApp }}
         - --max-tracked-executor-per-app={{ .Values.controller.maxTrackedExecutorPerApp }}
         {{- end }}

@@ -313,6 +313,12 @@ const (
 	// LabelSubmissionID is the label that records the submission ID of the current run of an application.
 	LabelSubmissionID = LabelAnnotationPrefix + "submission-id"
 
+	// AnnotationAppUID identifies the SparkApplication incarnation that submitted a driver.
+	AnnotationAppUID = LabelAnnotationPrefix + "app-uid"
+
+	// AnnotationAppGeneration identifies the application spec used to submit a driver.
+	AnnotationAppGeneration = LabelAnnotationPrefix + "app-generation"
+
 	// LabelSparkExecutorID is the label that records executor pod ID
 	LabelSparkExecutorID = "spark-exec-id"
 )

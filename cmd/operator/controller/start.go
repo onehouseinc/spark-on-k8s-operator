@@ -19,6 +19,7 @@ package controller
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 	"slices"
 	"time"
@@ -101,6 +102,7 @@ var (
 	leaderElectionRetryPeriod   time.Duration
 
 	driverPodCreationGracePeriod time.Duration
+	submissionTimeout            time.Duration
 
 	// Metrics
 	enableMetrics                 bool
@@ -127,12 +129,18 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
+// NewStartCommand builds the controller command and validates configuration before
+// startup connects to Kubernetes.
 func NewStartCommand() *cobra.Command {
 	var command = &cobra.Command{
 		Use:   "start",
 		Short: "Start controller and webhook",
-		PreRun: func(_ *cobra.Command, args []string) {
+		PreRunE: func(_ *cobra.Command, args []string) error {
+			if submissionTimeout <= 0 {
+				return fmt.Errorf("submission-timeout must be positive, got %s", submissionTimeout)
+			}
 			development = viper.GetBool("development")
+			return nil
 		},
 		Run: func(_ *cobra.Command, args []string) {
 			sparkoperator.PrintVersion(false)
@@ -166,6 +174,7 @@ func NewStartCommand() *cobra.Command {
 	command.Flags().DurationVar(&leaderElectionRetryPeriod, "leader-election-retry-period", 4*time.Second, "Leader election retry period.")
 
 	command.Flags().DurationVar(&driverPodCreationGracePeriod, "driver-pod-creation-grace-period", 10*time.Second, "Grace period after a successful spark-submit when driver pod not found errors will be retried. Useful if the driver pod can take some time to be created.")
+	command.Flags().DurationVar(&submissionTimeout, "submission-timeout", sparkapplication.DefaultSubmissionTimeout, "Positive time limit from recorded submission intent through preparation and spark-submit. Recovery uses the same deadline; keep this value consistent across controller replicas and leader handoffs.")
 
 	command.Flags().BoolVar(&enableMetrics, "enable-metrics", false, "Enable metrics.")
 	command.Flags().StringVar(&metricsBindAddress, "metrics-bind-address", "0", "The address the metric endpoint binds to. "+
@@ -271,7 +280,7 @@ func start() {
 		mgr.GetClient(),
 		mgr.GetEventRecorderFor("spark-application-controller"),
 		registry,
-		newSparkApplicationReconcilerOptions(),
+		newSparkApplicationReconcilerOptions(mgr.GetAPIReader()),
 	).SetupWithManager(mgr, newControllerOptions()); err != nil {
 		logger.Error(err, "Failed to create controller", "controller", "SparkApplication")
 		os.Exit(1)
@@ -392,7 +401,10 @@ func newControllerOptions() controller.Options {
 	return options
 }
 
-func newSparkApplicationReconcilerOptions() sparkapplication.Options {
+// newSparkApplicationReconcilerOptions passes parsed flags to submission and recovery.
+// apiReader bypasses the informer cache for decisions that may create or delete
+// driver resources; the regular manager client still provides writes and cached reads.
+func newSparkApplicationReconcilerOptions(apiReader client.Reader) sparkapplication.Options {
 	var sparkApplicationMetrics *metrics.SparkApplicationMetrics
 	var sparkExecutorMetrics *metrics.SparkExecutorMetrics
 	if enableMetrics {
@@ -402,6 +414,8 @@ func newSparkApplicationReconcilerOptions() sparkapplication.Options {
 		sparkExecutorMetrics.Register()
 	}
 	options := sparkapplication.Options{
+		APIReader:                    apiReader,
+		SubmissionTimeout:            submissionTimeout,
 		Namespaces:                   namespaces,
 		EnableUIService:              enableUIService,
 		IngressClassName:             ingressClassName,
