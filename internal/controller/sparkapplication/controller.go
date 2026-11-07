@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -54,6 +55,9 @@ import (
 var (
 	logger = log.Log.WithName("")
 )
+
+// Cleanup also waits on Services and Ingresses, which do not enqueue pod events.
+const pendingRerunRequeueInterval = 5 * time.Second
 
 // Options defines the options of the controller.
 type Options struct {
@@ -251,6 +255,8 @@ func (r *Reconciler) handleSparkApplicationDeletion(ctx context.Context, req ctr
 
 func (r *Reconciler) reconcileNewSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
+	var submittedApp *v1beta2.SparkApplication
+	var previousSubmissionID string
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
@@ -262,6 +268,9 @@ func (r *Reconciler) reconcileNewSparkApplication(ctx context.Context, req ctrl.
 				return nil
 			}
 			app := old.DeepCopy()
+			if submittedApp != nil {
+				return r.updateSubmittedSparkApplicationStatus(ctx, app, submittedApp, previousSubmissionID)
+			}
 
 			// Check for orphaned resources from previous submission attempts before submitting.
 			// This handles the case where the controller crashed after creating resources but before
@@ -311,7 +320,9 @@ func (r *Reconciler) reconcileNewSparkApplication(ctx context.Context, req ctrl.
 				"namespace", app.Namespace,
 				"resourcesClean", true)
 
+			previousSubmissionID = old.Status.SubmissionID
 			_ = r.submitSparkApplication(app)
+			submittedApp = app.DeepCopy()
 			if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
 				return err
 			}
@@ -357,6 +368,8 @@ func (r *Reconciler) reconcileSubmittedSparkApplication(ctx context.Context, req
 
 func (r *Reconciler) reconcileFailedSubmissionSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
+	var submittedApp *v1beta2.SparkApplication
+	var previousSubmissionID string
 
 	var result ctrl.Result
 
@@ -371,6 +384,9 @@ func (r *Reconciler) reconcileFailedSubmissionSparkApplication(ctx context.Conte
 				return nil
 			}
 			app := old.DeepCopy()
+			if submittedApp != nil {
+				return r.updateSubmittedSparkApplicationStatus(ctx, app, submittedApp, previousSubmissionID)
+			}
 
 			if util.ShouldRetry(app) {
 				timeUntilNextRetryDue, err := util.TimeUntilNextRetryDue(app)
@@ -379,7 +395,9 @@ func (r *Reconciler) reconcileFailedSubmissionSparkApplication(ctx context.Conte
 				}
 				if timeUntilNextRetryDue <= 0 {
 					if r.validateSparkResourceDeletion(ctx, app) {
+						previousSubmissionID = old.Status.SubmissionID
 						_ = r.submitSparkApplication(app)
+						submittedApp = app.DeepCopy()
 					} else {
 						if err := r.deleteSparkResources(ctx, app); err != nil {
 							logger.Error(err, "failed to delete resources associated with SparkApplication", "name", app.Name, "namespace", app.Namespace)
@@ -443,9 +461,13 @@ func (r *Reconciler) reconcileRunningSparkApplication(ctx context.Context, req c
 
 func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
+	var submittedApp *v1beta2.SparkApplication
+	var previousSubmissionID string
+	var result ctrl.Result
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
+			result = ctrl.Result{}
 			old, err := r.getSparkApplication(key)
 			if err != nil {
 				return err
@@ -454,6 +476,9 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 				return nil
 			}
 			app := old.DeepCopy()
+			if submittedApp != nil {
+				return r.updateSubmittedSparkApplicationStatus(ctx, app, submittedApp, previousSubmissionID)
+			}
 
 			logger.Info("Pending rerun SparkApplication", "name", app.Name, "namespace", app.Namespace, "state", app.Status.AppState.State)
 
@@ -500,24 +525,12 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 					if app.Status.DriverInfo.PodName == "" {
 						app.Status.DriverInfo.PodName = driverPod.Name
 					}
-					// Restore the submission ID for this live attempt
-					// resetSparkApplicationStatus clears this field when entering PENDING_RERUN,
-					// but the driver pod retains it in its label
-					if app.Status.SubmissionID == "" && podSubmissionID != "" {
+					// A restart after spark-submit can leave a nonempty ID from the previous run.
+					if podSubmissionID != "" && app.Status.SubmissionID != podSubmissionID {
 						logger.Info("Restoring SubmissionID from driver pod label",
-							"name", app.Name,
-							"namespace", app.Namespace,
-							"podSubmissionID", podSubmissionID,
-							"appSubmissionID", app.Status.SubmissionID)
+							"name", app.Name, "namespace", app.Namespace,
+							"podSubmissionID", podSubmissionID, "appSubmissionID", app.Status.SubmissionID)
 						app.Status.SubmissionID = podSubmissionID
-					} else if app.Status.SubmissionID != "" && podSubmissionID != "" && app.Status.SubmissionID != podSubmissionID {
-						// Log mismatch detection - this indicates a bug
-						logger.Error(nil, "SubmissionID MISMATCH detected - pod updates may be ignored!",
-							"name", app.Name,
-							"namespace", app.Namespace,
-							"appSubmissionID", app.Status.SubmissionID,
-							"podSubmissionID", podSubmissionID,
-							"action", "NOT_RESTORING")
 					}
 					// Preserve the start time and execution attempts from the pod's creation time
 					// since the application is already running
@@ -546,11 +559,21 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 			}
 
 			// If resources are deleted, proceed with normal resubmission flow
+			if app.Status.AppState.State != v1beta2.ApplicationStatePendingRerun {
+				return r.updateSparkApplicationStatus(ctx, app)
+			}
 			if r.validateSparkResourceDeletion(ctx, app) {
 				logger.Info("Successfully deleted resources associated with SparkApplication", "name", app.Name, "namespace", app.Namespace, "state", app.Status.AppState.State)
 				r.recordSparkApplicationEvent(app)
 				r.resetSparkApplicationStatus(app)
+				previousSubmissionID = old.Status.SubmissionID
 				_ = r.submitSparkApplication(app)
+				submittedApp = app.DeepCopy()
+			} else {
+				result.RequeueAfter = pendingRerunRequeueInterval
+			}
+			if equality.Semantic.DeepEqual(old.Status, app.Status) {
+				return nil
 			}
 			if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
 				return err
@@ -560,9 +583,9 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 	)
 	if retryErr != nil {
 		logger.Error(retryErr, "Failed to reconcile SparkApplication", "name", key.Name, "namespace", key.Namespace)
-		return ctrl.Result{}, retryErr
+		return result, retryErr
 	}
-	return ctrl.Result{}, nil
+	return result, nil
 }
 
 func (r *Reconciler) reconcileInvalidatingSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -1074,6 +1097,16 @@ func (r *Reconciler) updateSparkApplicationState(ctx context.Context, app *v1bet
 	}
 
 	return nil
+}
+
+// A status conflict must not repeat spark-submit or overwrite a newer run/spec.
+func (r *Reconciler) updateSubmittedSparkApplicationStatus(ctx context.Context, app, submitted *v1beta2.SparkApplication, previousSubmissionID string) error {
+	if app.UID != submitted.UID || app.Generation != submitted.Generation ||
+		!app.DeletionTimestamp.IsZero() || app.Status.SubmissionID != previousSubmissionID {
+		return nil
+	}
+	app.Status = *submitted.Status.DeepCopy()
+	return r.updateSparkApplicationStatus(ctx, app)
 }
 
 // updateSparkApplicationStatus updates the status of the SparkApplication.
