@@ -273,8 +273,40 @@ func (r *Reconciler) reconcileNewSparkApplication(ctx context.Context, req ctrl.
 	return r.reconcileSubmission(ctx, req, v1beta2.ApplicationStateNew)
 }
 
+// reconcileSubmittedSparkApplication follows an application whose driver has been
+// created but has not started running yet. An application enters SUBMITTED when
+// spark-submit returns successfully, or when recovery adopts a Pending driver. The
+// driver is usually Pending: waiting to be scheduled, pulling its image or mounting
+// volumes.
+//
+// In this state the operator watches the driver and moves the application on:
+//   - Driver missing: within DriverPodCreationGracePeriod (default 10s) of the
+//     attempt start, return an error and retry. After that, FAILING with "driver
+//     pod not found".
+//   - Driver not usable: owned by another application, or carrying an unrecorded
+//     submission ID, is an error. Launched from an older spec moves the application
+//     to INVALIDATING, which reruns it.
+//   - Driver phase: Pending stays SUBMITTED, Running becomes RUNNING, Succeeded
+//     becomes SUCCEEDING, Failed becomes FAILING with the exit code, and anything
+//     else becomes UNKNOWN. Each change records a driver event.
+//   - Executors: each executor's state is recorded, up to MaxTrackedExecutorPerApp
+//     (default 1000), with an event on each change. The Spark application ID is
+//     taken from the executors when they have one.
+//
+// It runs on driver and executor pod events for the current submission, on
+// application events, and at least every activeRecheckInterval (5 min) as a
+// safety net for missed events. reconcileRunningSparkApplication does the same for
+// RUNNING.
+//
+// Returns:
+//   - RequeueAfter activeRecheckInterval and a nil error when the status was saved
+//     or the application has left SUBMITTED.
+//   - An error when the driver could not be read or used, or the status write kept
+//     conflicting. controller-runtime logs it and requeues with backoff.
 func (r *Reconciler) reconcileSubmittedSparkApplication(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	key := req.NamespacedName
+	// A status conflict means another writer changed the application; read it
+	// again and work out the state from the latest copy.
 	retryErr := retry.RetryOnConflict(
 		retry.DefaultRetry,
 		func() error {
@@ -282,14 +314,19 @@ func (r *Reconciler) reconcileSubmittedSparkApplication(ctx context.Context, req
 			if err != nil {
 				return err
 			}
+			// Another writer has already moved the application on, for example the
+			// event filter set INVALIDATING after a spec change.
 			if old.Status.AppState.State != v1beta2.ApplicationStateSubmitted {
 				return nil
 			}
 			app := old.DeepCopy()
 
+			// Read the driver and executors and work out the new state in memory.
 			if err := r.updateSparkApplicationState(ctx, app); err != nil {
 				return err
 			}
+			// Save it. The write is checked against resourceVersion, so a stale
+			// copy cannot overwrite a newer status.
 			if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
 				return err
 			}
@@ -657,11 +694,23 @@ func (r *Reconciler) submitSparkApplication(app *v1beta2.SparkApplication) error
 	return nil
 }
 
-// updateDriverState derives application status from a live driver read after
-// checking ownership, spec generation and submission identity. It updates only
-// the in-memory app; the caller persists it with resource-version protection.
+// updateDriverState reads the live driver pod and works out the application state
+// from it. It is called for SUBMITTED, RUNNING and UNKNOWN applications, and when
+// recovery adopts a driver. It only changes the in-memory app; the caller saves it
+// with a resourceVersion check, so a stale copy cannot overwrite a newer status.
+//
+// Returns:
+//   - nil: app holds the new state. It may be unchanged, FAILING because the
+//     driver is gone, or INVALIDATING because the spec changed.
+//   - an error: no driver name is recorded, the driver could not be read, it is
+//     missing but still within the grace period, or it belongs to another
+//     application or submission. The caller saves nothing and the reconcile is
+//     retried.
 func (r *Reconciler) updateDriverState(ctx context.Context, app *v1beta2.SparkApplication) error {
-	// Either the driver pod doesn't exist yet or its name has not been updated.
+	// 1. No driver name is recorded.
+	//    When: not expected once a submission has started, because the intent saves
+	//    the name before spark-submit runs.
+	//    Result: error.
 	if app.Status.DriverInfo.PodName == "" {
 		return fmt.Errorf("empty driver pod name with application state %s", app.Status.AppState.State)
 	}
@@ -671,6 +720,15 @@ func (r *Reconciler) updateDriverState(ctx context.Context, app *v1beta2.SparkAp
 		return err
 	}
 
+	// 2. The driver pod does not exist.
+	//    When: it was deleted, by a user or by garbage collection, or it is not
+	//    visible yet just after submission.
+	//    Result: in SUBMITTED and within DriverPodCreationGracePeriod of the attempt
+	//    start, return an error so the reconcile is retried. Otherwise mark the
+	//    application FAILING with "driver pod not found"; the FAILING handler then
+	//    applies the restart policy. The grace period counts from the attempt start,
+	//    before spark-submit runs, so it has usually passed by the time the
+	//    application is SUBMITTED.
 	if driverPod == nil {
 		if app.Status.AppState.State != v1beta2.ApplicationStateSubmitted || metav1.Now().Sub(app.Status.LastSubmissionAttemptTime.Time) > r.options.DriverPodCreationGracePeriod {
 			glog.Warningf("Expected driver pod %s/%s was not found for SparkApplication %s (state=%s, submissionID=%s)",
@@ -683,6 +741,13 @@ func (r *Reconciler) updateDriverState(ctx context.Context, app *v1beta2.SparkAp
 		return fmt.Errorf("driver pod not found, while inside the grace period. Grace period of %v expires at %v", r.options.DriverPodCreationGracePeriod, app.Status.LastSubmissionAttemptTime.Add(r.options.DriverPodCreationGracePeriod))
 	}
 
+	// 3. The pod is not this submission's driver.
+	//    - Owned by another application, for example an earlier application with
+	//      the same name: error. Another application's pod is never used.
+	//    - Launched from an older spec (the generation annotation differs):
+	//      INVALIDATING, which deletes the driver and submits again.
+	//    - Labelled with a different submission ID: error. The attempt it belongs
+	//      to is unknown.
 	if !resourceBelongsToApp(app, driverPod) {
 		return fmt.Errorf("driver pod %s does not belong to SparkApplication %s", driverPod.Name, app.Name)
 	}
@@ -694,8 +759,18 @@ func (r *Reconciler) updateDriverState(ctx context.Context, app *v1beta2.SparkAp
 		return fmt.Errorf("driver pod %s has an unrecorded submission ID", driverPod.Name)
 	}
 
+	// 4. The pod is this submission's driver: take the Spark application ID and
+	//    the state from it. GetDriverState uses the pod phase, and the driver
+	//    container's exit code once the container has stopped, even if sidecars
+	//    keep the pod Running:
+	//      Pending → SUBMITTED, Running → RUNNING, stopped with exit code 0 →
+	//      SUCCEEDING, stopped with a non-zero exit code → FAILING, anything else
+	//      → UNKNOWN.
 	app.Status.SparkApplicationID = util.GetSparkApplicationID(driverPod)
 	driverState := util.GetDriverState(driverPod)
+
+	// A stopped driver sets TerminationTime once; the TTL and the execution-time
+	// metrics count from it. A failed driver also records why it failed.
 	if util.IsDriverTerminated(driverState) {
 		if app.Status.TerminationTime.IsZero() {
 			app.Status.TerminationTime = metav1.Now()
@@ -721,34 +796,53 @@ func (r *Reconciler) updateDriverState(ctx context.Context, app *v1beta2.SparkAp
 	return nil
 }
 
-// updateExecutorState lists the executor pods of the application
-// and updates the executor state based on the current phase of the pods.
+// updateExecutorState records the state of each executor of the current
+// submission in app.Status.ExecutorState, and records an event when an executor
+// appears or changes state. It runs after updateDriverState (for SUBMITTED, RUNNING
+// and UNKNOWN applications, and when recovery adopts a driver) and again for
+// COMPLETED and FAILED applications. It only changes the in-memory app; the caller
+// saves it.
+//
+// Executor pods are read from the informer cache, not the live API. A stale read
+// here only delays a status update and never starts or deletes anything. Executors
+// already recorded for this run are kept, so the map lists every executor the run
+// has had; a new submission starts with an empty map.
+//
+// Returns an error only when the executor pods cannot be listed.
 func (r *Reconciler) updateExecutorState(_ context.Context, app *v1beta2.SparkApplication) error {
+	// 1. List this submission's executor pods: labelled with this application's
+	//    name, its current submission ID and spark-role=executor. Executors of
+	//    earlier runs do not match.
 	podList, err := r.getExecutorPods(app)
 	if err != nil {
 		return err
 	}
 	pods := podList.Items
 
+	// 2. Work out each executor's state from its pod phase: Pending → PENDING,
+	//    Running → RUNNING, Succeeded → COMPLETED, Failed → FAILED, anything else
+	//    → UNKNOWN.
 	executorStateMap := make(map[string]v1beta2.ExecutorState)
 	var executorApplicationID string
 	for _, pod := range pods {
 		if util.IsExecutorPod(&pod) {
-			// If the executor number is higher than the `MaxTrackedExecutorPerApp` we want to stop persisting executors
+			// Executors with an ID above MaxTrackedExecutorPerApp (default 1000) are
+			// not tracked, which keeps the status object small.
 			if executorID, _ := strconv.Atoi(util.GetSparkExecutorID(&pod)); executorID > r.options.MaxTrackedExecutorPerApp {
 				continue
 			}
 			newState := util.GetExecutorState(&pod)
 			oldState, exists := app.Status.ExecutorState[pod.Name]
-			// Only record an executor event if the executor state is new or it has changed.
+			// Record an event only when the executor is new or its state changed.
+			// A failed executor's event carries the container's exit code and
+			// reason, or -1 and "Unknown (Container not Found)" when the container
+			// status is missing.
 			if !exists || newState != oldState {
 				if newState == v1beta2.ExecutorStateFailed {
 					execContainerState := util.GetExecutorContainerTerminatedState(&pod)
 					if execContainerState != nil {
 						r.recordExecutorEvent(app, newState, pod.Name, execContainerState.ExitCode, execContainerState.Reason)
 					} else {
-						// If we can't find the container state,
-						// we need to set the exitCode and the Reason to unambiguous values.
 						r.recordExecutorEvent(app, newState, pod.Name, -1, "Unknown (Container not Found)")
 					}
 				} else {
@@ -1115,64 +1209,118 @@ func (r *Reconciler) cleanUpPodTemplateFiles(app *v1beta2.SparkApplication) erro
 	return nil
 }
 
-// reconcileSubmission handles NEW, SUBMISSION_FAILED and PENDING_RERUN.
-// It first recovers any recorded attempt, then applies retry policy and cleanup
-// before starting another one. The expected state prevents a retry from acting on
-// an application that another writer has already advanced or invalidated.
+// reconcileSubmission submits an application in NEW, SUBMISSION_FAILED or
+// PENDING_RERUN, and never runs spark-submit twice for the same attempt. Each pass
+// reads the live application and stops at the first numbered step that applies.
+// A status conflict restarts the pass from step 1.
+//
+// Returns:
+//   - result: requeue after submissionRecheckInterval, or, while step 4 waits for
+//     the next retry, after the time until that retry is due.
+//   - err=nil: the pass finished a step, including when the step was to wait.
+//   - err!=nil: a read, write or delete failed, or recovery refused a driver.
+//     controller-runtime logs the error and requeues with backoff.
 func (r *Reconciler) reconcileSubmission(ctx context.Context, req ctrl.Request, expectedState v1beta2.ApplicationStateType) (ctrl.Result, error) {
 	result := ctrl.Result{RequeueAfter: submissionRecheckInterval}
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// 1. The application is gone, being deleted, or no longer in expectedState.
+		//    When: it was deleted, or another writer moved it on, for example the
+		//    event filter set INVALIDATING or an earlier pass saved SUBMITTED.
+		//    Result: skip this pass.
 		app, err := r.getSparkApplication(ctx, req.NamespacedName)
 		if err != nil {
-			return client.IgnoreNotFound(err)
+			if errors.IsNotFound(err) {
+				logger.Info("SparkApplication not found, skipping submission", "name", req.Name, "namespace", req.Namespace, "state", expectedState)
+				return nil
+			}
+			logger.Error(err, "Failed to get SparkApplication for submission", "name", req.Name, "namespace", req.Namespace, "state", expectedState)
+			return err
 		}
 		if app.Status.AppState.State != expectedState || !app.DeletionTimestamp.IsZero() {
 			return nil
 		}
+
+		// 2. A driver from an earlier attempt exists.
+		//    Result: recoverSubmission adopts it, waits for it, invalidates it or
+		//    refuses it (see its comments), and this pass stops there.
 		if handled, err := r.recoverSubmission(ctx, app); handled || err != nil {
 			return err
 		}
-		// A previous operator may still be submitting after leadership changes.
-		// Keep its identity until the bounded submit process has had time to exit.
-		if app.Status.SubmissionID != "" && !app.Status.LastSubmissionAttemptTime.IsZero() &&
-			app.Status.TerminationTime.IsZero() && app.Status.AppState.ErrorMessage == "" {
-			if time.Since(app.Status.LastSubmissionAttemptTime.Time) < r.options.SubmissionTimeout {
+
+		// 3. An attempt is recorded but has no driver and no saved outcome.
+		//    When: spark-submit is still running, here or on a previous leader, or
+		//    the operator stopped before spark-submit created the driver.
+		//    Result: wait until SubmissionTimeout, since spark-submit may still
+		//    create the driver. After that, count the attempt and save it as
+		//    SUBMISSION_FAILED, so the restart policy (including Never) applies to
+		//    it on the next pass.
+		attemptAwaitingOutcome := app.Status.SubmissionID != "" &&
+			!app.Status.LastSubmissionAttemptTime.IsZero() &&
+			app.Status.TerminationTime.IsZero() &&
+			app.Status.AppState.ErrorMessage == ""
+		if attemptAwaitingOutcome {
+			if r.withinSubmitDeadline(app) {
+				logger.V(1).Info("Waiting for an in-flight submission", "name", app.Name, "namespace", app.Namespace,
+					"submissionID", app.Status.SubmissionID)
 				return nil
 			}
-			// Save the expired attempt before applying retry policy on the next pass;
-			// otherwise a lost outcome could bypass Never or exhaust the budget unnoticed.
 			app.Status.SubmissionAttempts++
 			app.Status.AppState = v1beta2.ApplicationState{
 				State:        v1beta2.ApplicationStateFailedSubmission,
 				ErrorMessage: "submission timed out before driver creation",
 			}
-			return r.updateSparkApplicationStatus(ctx, app)
+			if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
+				return err
+			}
+			logger.Info("Submission timed out before the driver was created", "name", app.Name, "namespace", app.Namespace,
+				"submissionID", app.Status.SubmissionID)
+			return nil
 		}
+
+		// 4. The last attempt failed (SUBMISSION_FAILED).
+		//    Result: apply the restart policy. With no retries left, mark FAILED.
+		//    If the next retry is not due yet, requeue for when it is.
 		if expectedState == v1beta2.ApplicationStateFailedSubmission {
 			if !util.ShouldRetry(app) {
 				app.Status.AppState.State = v1beta2.ApplicationStateFailed
 				app.Status.TerminationTime = metav1.Now()
-				return r.updateSparkApplicationStatus(ctx, app)
+				if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
+					return err
+				}
+				logger.Info("No submission retries left, marking SparkApplication FAILED", "name", app.Name,
+					"namespace", app.Namespace, "submissionAttempts", app.Status.SubmissionAttempts)
+				return nil
 			}
-			delay, err := util.TimeUntilNextRetryDue(app)
+			retryDelay, err := util.TimeUntilNextRetryDue(app)
 			if err != nil {
 				return err
 			}
-			if delay > 0 {
-				result.RequeueAfter = delay
+			if retryDelay > 0 {
+				result.RequeueAfter = retryDelay
 				return nil
 			}
 		}
-		resources, err := r.getSparkResources(ctx, app)
+
+		// 5. Resources from an earlier attempt still exist: driver, UI Service or Ingress.
+		//    When: a previous run is being replaced (a retry or PENDING_RERUN), or an
+		//    earlier attempt left them behind.
+		//    Result: delete them, with ownership checks and preconditions, and wait
+		//    for the next pass. A new driver would clash with the old names.
+		leftovers, err := r.getSparkResources(ctx, app)
 		if err != nil {
 			return err
 		}
-		if len(resources) != 0 {
+		if len(leftovers) != 0 {
 			if expectedState == v1beta2.ApplicationStateNew && r.options.SparkApplicationMetrics != nil {
 				r.options.SparkApplicationMetrics.IncOrphanedResourceCleanupCount(app)
 			}
-			return r.deleteObservedResources(ctx, app, resources)
+			logger.V(1).Info("Deleting resources left by an earlier attempt", "name", app.Name, "namespace", app.Namespace,
+				"resources", len(leftovers))
+			return r.deleteObservedResources(ctx, app, leftovers)
 		}
+
+		// 6. Nothing is in the way: start a new attempt. A rerun first clears the
+		//    previous run's status.
 		if expectedState == v1beta2.ApplicationStatePendingRerun {
 			r.resetSparkApplicationStatus(app)
 		}
@@ -1181,78 +1329,184 @@ func (r *Reconciler) reconcileSubmission(ctx context.Context, req ctrl.Request, 
 	return result, err
 }
 
-// recoverSubmission uses the live driver to recover a lost submit outcome.
-// A true result means this pass recovered, is waiting for, or rejected that driver;
-// the caller must not start another submission. False permits normal retry/cleanup
-// only when the error is nil. Retired and completed attempts are never revived.
-func (r *Reconciler) recoverSubmission(ctx context.Context, app *v1beta2.SparkApplication) (bool, error) {
-	pod, err := r.getDriverPod(ctx, app)
-	if err != nil || pod == nil {
+// withinSubmitDeadline reports whether the recorded attempt may still be running
+// spark-submit, because SubmissionTimeout has not passed since it started.
+func (r *Reconciler) withinSubmitDeadline(app *v1beta2.SparkApplication) bool {
+	return time.Since(app.Status.LastSubmissionAttemptTime.Time) < r.options.SubmissionTimeout
+}
+
+// recoverSubmission looks for a driver pod left by an earlier submission attempt
+// before reconcileSubmission starts a new one, so an application is never
+// launched twice. The usual case is an operator that crashed or lost leadership
+// after spark-submit created the driver but before the outcome was saved.
+//
+// Returns:
+//   - handled=false, err=nil: there is no driver to recover. The caller continues
+//     with the retry policy, cleanup and a new submission.
+//   - handled=true, err=nil: the driver was dealt with in this pass: waited for,
+//     invalidated, failed or adopted. The caller must not submit.
+//   - handled=true, err!=nil: the driver cannot be used safely (it belongs to
+//     another application or to an unrecorded attempt), or a status write or
+//     delete failed. The caller returns the error and does not submit.
+//   - handled=false, err!=nil: the driver pod could not be read. The caller
+//     returns the error and does not submit.
+func (r *Reconciler) recoverSubmission(ctx context.Context, app *v1beta2.SparkApplication) (handled bool, err error) {
+	driver, err := r.getDriverPod(ctx, app)
+	if err != nil || driver == nil {
 		return false, err
 	}
-	if pod.Labels[common.LabelSparkAppName] != app.Name || !resourceBelongsToApp(app, pod) {
-		return true, fmt.Errorf("driver pod %s does not belong to SparkApplication %s", pod.Name, app.Name)
+
+	// 1. The pod has the driver's name but is not this application's driver.
+	//    When: the application was deleted and recreated with the same name before
+	//    its old driver was removed, or another application uses the same driver name.
+	//    Result: error. Another application's pod is never adopted or deleted.
+	if driver.Labels[common.LabelSparkAppName] != app.Name || !resourceBelongsToApp(app, driver) {
+		return true, fmt.Errorf("driver pod %s does not belong to SparkApplication %s", driver.Name, app.Name)
 	}
-	if !pod.DeletionTimestamp.IsZero() {
+
+	// 2. The driver is being deleted.
+	//    When: cleanup or invalidation deleted it and it is still terminating.
+	//    Result: wait until it is gone.
+	if !driver.DeletionTimestamp.IsZero() {
+		logger.V(1).Info("Waiting for driver pod to terminate", "name", app.Name, "namespace", app.Namespace, "driver", driver.Name)
 		return true, nil
 	}
-	if driverGenerationChanged(app, pod) {
+
+	// 3. The driver was launched from an older spec.
+	//    When: the spec was edited while a submit was in flight or while the
+	//    operator was down, so the event filter missed the change.
+	//    Result: INVALIDATING, which deletes the driver and submits again.
+	if driverGenerationChanged(app, driver) {
 		app.Status.AppState = v1beta2.ApplicationState{State: v1beta2.ApplicationStateInvalidating}
-		return true, r.updateSparkApplicationStatus(ctx, app)
+		if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
+			return true, err
+		}
+		logger.Info("Driver pod was launched from an older spec, invalidating SparkApplication",
+			"name", app.Name, "namespace", app.Namespace, "driver", driver.Name, "generation", app.Generation)
+		return true, nil
 	}
-	if pod.Labels[common.LabelSubmissionID] != "" && pod.Labels[common.LabelSubmissionID] != app.Status.SubmissionID {
-		return true, fmt.Errorf("driver pod %s has an unrecorded submission ID; refusing to adopt or delete it", pod.Name)
+
+	// 4. The driver's submission ID is not the one saved in status.
+	//    With a single operator on this version this cannot happen: cleanup removes
+	//    the old driver before a new ID is saved, and spark-submit labels the driver
+	//    with the saved ID.
+	//    When:
+	//      - the operator was upgraded from a version that saved the ID only after
+	//        spark-submit returned, and that version crashed in between;
+	//      - two replicas disagree on the submit deadline (clock skew or a different
+	//        --submission-timeout), so one saves a new ID while the other's
+	//        spark-submit is still creating the old driver.
+	//    Result: error. The attempt the driver belongs to is unknown, so it is
+	//    neither adopted nor deleted; the error repeats until someone removes it.
+	driverSubmissionID := driver.Labels[common.LabelSubmissionID]
+	if driverSubmissionID != "" && driverSubmissionID != app.Status.SubmissionID {
+		return true, fmt.Errorf("driver pod %s has an unrecorded submission ID %s (status has %q); refusing to adopt or delete it",
+			driver.Name, driverSubmissionID, app.Status.SubmissionID)
 	}
-	// Invalidation leaves the old ID but clears the attempt time. A finished run
-	// retains its termination time. Neither is an interrupted new submission.
-	if app.Status.SubmissionID == "" || app.Status.LastSubmissionAttemptTime.IsZero() || !app.Status.TerminationTime.IsZero() {
+
+	// 5. No submission attempt is in progress.
+	//    When: after invalidation (the ID is kept but the attempt time is cleared),
+	//    after a finished run (the termination time is set), or before the first
+	//    submission.
+	//    Result: no recovery. The driver is a leftover, and the caller's cleanup
+	//    deletes it.
+	attemptInProgress := app.Status.SubmissionID != "" &&
+		!app.Status.LastSubmissionAttemptTime.IsZero() &&
+		app.Status.TerminationTime.IsZero()
+	if !attemptInProgress {
 		return false, nil
 	}
-	missingConfigMapName, err := r.missingDriverConfigMap(ctx, pod)
+
+	// 6. The driver is Pending and its ConfigMap does not exist.
+	//    When: Spark creates the ConfigMap after the driver pod, so a spark-submit
+	//    killed between the two leaves a driver that can never start.
+	//    Result: wait until SubmissionTimeout, since spark-submit may still create
+	//    it. After that, save the attempt as SUBMISSION_FAILED and delete the driver.
+	missingConfigMapName, err := r.missingDriverConfigMap(ctx, driver)
 	if err != nil {
 		return true, err
 	}
-	if missingConfigMapName != "" && time.Since(app.Status.LastSubmissionAttemptTime.Time) < r.options.SubmissionTimeout {
-		return true, nil
-	}
-	// A saved failure already counted its attempt. A new intent clears the error
-	// even when it starts from SUBMISSION_FAILED, so its lost outcome still counts.
-	if app.Status.AppState.State != v1beta2.ApplicationStateFailedSubmission || app.Status.AppState.ErrorMessage == "" {
-		app.Status.SubmissionAttempts++
-	}
 	if missingConfigMapName != "" {
+		if r.withinSubmitDeadline(app) {
+			logger.V(1).Info("Waiting for driver ConfigMap", "name", app.Name, "namespace", app.Namespace,
+				"driver", driver.Name, "configMap", missingConfigMapName)
+			return true, nil
+		}
+		countRecoveredAttempt(app)
 		app.Status.AppState = v1beta2.ApplicationState{
 			State:        v1beta2.ApplicationStateFailedSubmission,
 			ErrorMessage: fmt.Sprintf("submission timed out waiting for driver ConfigMap %s", missingConfigMapName),
 		}
-		// Persist failure before deleting its evidence. A failed status write must
-		// leave the partial driver available so the next pass can count the attempt.
+		// Save the failure before deleting the driver. If the write fails, the driver
+		// is still there, so the next pass can count the attempt.
 		if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
 			return true, err
 		}
-		return true, r.deleteObservedResources(ctx, app, []client.Object{pod})
+		logger.Info("Driver ConfigMap still missing after the submission deadline, deleting driver pod",
+			"name", app.Name, "namespace", app.Namespace, "driver", driver.Name, "configMap", missingConfigMapName)
+		return true, r.deleteObservedResources(ctx, app, []client.Object{driver})
 	}
+
+	// 7. The driver belongs to the attempt in progress and can run.
+	//    When: the operator crashed, lost leadership or failed to save the outcome
+	//    after spark-submit created the driver.
+	//    Result: adopt it. Count the attempt and take the state from the driver
+	//    instead of submitting again.
+	countRecoveredAttempt(app)
 	app.Status.ExecutionAttempts++
 	app.Status.AppState.ErrorMessage = ""
 	app.Status.ExecutorState = nil
-	app.Status.DriverInfo.PodName = pod.Name
+	app.Status.DriverInfo.PodName = driver.Name
 	if err := r.updateSparkApplicationState(ctx, app); err != nil {
 		return true, err
 	}
-	return true, r.updateSparkApplicationStatus(ctx, app)
+	if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
+		return true, err
+	}
+	logger.Info("Adopted driver pod from an interrupted submission", "name", app.Name, "namespace", app.Namespace,
+		"driver", driver.Name, "submissionID", app.Status.SubmissionID, "state", app.Status.AppState.State)
+	return true, nil
 }
 
-// resourceBelongsToApp requires evidence tied to this application's UID,
-// not just its reusable name. Owner references support older resources; a UID
-// annotation supports drivers created without the webhook. Conflicting stamps veto both.
-func resourceBelongsToApp(app *v1beta2.SparkApplication, object client.Object) bool {
-	if uid, stamped := object.GetAnnotations()[common.AnnotationAppUID]; stamped && uid != string(app.UID) {
+// countRecoveredAttempt counts the submission attempt whose outcome recovery is
+// about to save. A failure already saved for this attempt has counted it. A new
+// attempt clears the error message, so an attempt that started from
+// SUBMISSION_FAILED and lost its outcome is still counted.
+func countRecoveredAttempt(app *v1beta2.SparkApplication) {
+	failureAlreadySaved := app.Status.AppState.State == v1beta2.ApplicationStateFailedSubmission &&
+		app.Status.AppState.ErrorMessage != ""
+	if !failureAlreadySaved {
+		app.Status.SubmissionAttempts++
+	}
+}
+
+// resourceBelongsToApp checks a live Kubernetes resource against the stored
+// SparkApplication before the operator adopts, tracks or deletes it. A resource
+// records its owner in two ways:
+//   - a controller owner reference, set by the webhook on driver pods and by the
+//     operator on the Services and Ingresses it creates;
+//   - the app UID annotation, set by spark-submit on drivers this operator launches.
+//
+// UIDs are compared, not names, because an application that is deleted and
+// recreated keeps its name but gets a new UID.
+func resourceBelongsToApp(app *v1beta2.SparkApplication, resource client.Object) bool {
+	ownerRef := metav1.GetControllerOf(resource)
+	annotatedUID, hasAnnotation := resource.GetAnnotations()[common.AnnotationAppUID]
+
+	// Annotated for a different application, whatever its owner reference says.
+	if hasAnnotation && annotatedUID != string(app.UID) {
 		return false
 	}
-	if owner := metav1.GetControllerOf(object); owner != nil {
-		return owner.Kind == "SparkApplication" && owner.Name == app.Name && owner.UID == app.UID
+
+	// Owned by a controller: it must be this application.
+	if ownerRef != nil {
+		return ownerRef.Kind == "SparkApplication" &&
+			ownerRef.Name == app.Name &&
+			ownerRef.UID == app.UID
 	}
-	return object.GetAnnotations()[common.AnnotationAppUID] == string(app.UID) && app.UID != ""
+
+	// No owner: only an annotation with this application's UID counts.
+	return hasAnnotation && annotatedUID == string(app.UID) && app.UID != ""
 }
 
 // missingDriverConfigMap checks the generated ConfigMap needed by a Pending
@@ -1280,12 +1534,25 @@ func (r *Reconciler) missingDriverConfigMap(ctx context.Context, pod *corev1.Pod
 	return "", nil
 }
 
-// driverGenerationChanged detects a stamped driver from a different spec.
-// An unstamped legacy driver provides no generation evidence; absence alone must
-// not invalidate it.
-func driverGenerationChanged(app *v1beta2.SparkApplication, pod *corev1.Pod) bool {
-	generation, stamped := pod.Annotations[common.AnnotationAppGeneration]
-	return stamped && generation != strconv.FormatInt(app.Generation, 10)
+// driverGenerationChanged reports whether the stored SparkApplication's spec has
+// changed since the live driver pod was launched. It compares:
+//   - the application's metadata.generation, which Kubernetes increments on
+//     every spec change;
+//   - the driver's app generation annotation, a copy of that generation that
+//     spark-submit adds at launch and that never changes afterwards.
+//
+// A mismatch means the driver runs an outdated spec. Callers then move the
+// application to INVALIDATING, which deletes the driver and submits it again.
+func driverGenerationChanged(app *v1beta2.SparkApplication, driver *corev1.Pod) bool {
+	annotatedGeneration, hasAnnotation := driver.Annotations[common.AnnotationAppGeneration]
+
+	// No annotation, for example a driver launched by an older operator version:
+	// there is nothing to compare, so treat it as unchanged rather than restart it.
+	if !hasAnnotation {
+		return false
+	}
+
+	return annotatedGeneration != strconv.FormatInt(app.Generation, 10)
 }
 
 // startSubmissionAttempt saves identity and start time before creating resources
