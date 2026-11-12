@@ -489,9 +489,6 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 						"name", app.Name, "namespace", app.Namespace, "podName", driverPod.Name,
 						"podAppName", podAppName, "expectedAppName", app.Name)
 				} else if (driverPod.Status.Phase == corev1.PodRunning || driverPod.Status.Phase == corev1.PodPending) && driverPod.DeletionTimestamp == nil {
-					// Don't check submission ID mismatch here - in PENDING_RERUN state, the app's
-					// SubmissionID is stale (from the previous attempt). We want to adopt the
-					// running pod and restore its submission ID to the app status.
 					// Driver pod exists and belongs to this app - check if it's running or pending
 					// Also verify it's not being deleted (DeletionTimestamp is nil)
 					logger.Info("Driver pod exists and is running/pending, syncing application state",
@@ -500,24 +497,16 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 					if app.Status.DriverInfo.PodName == "" {
 						app.Status.DriverInfo.PodName = driverPod.Name
 					}
-					// Restore the submission ID for this live attempt
-					// resetSparkApplicationStatus clears this field when entering PENDING_RERUN,
-					// but the driver pod retains it in its label
-					if app.Status.SubmissionID == "" && podSubmissionID != "" {
-						logger.Info("Restoring SubmissionID from driver pod label",
+					// In PENDING_RERUN the app's SubmissionID may belong to the invalidated run, while the
+					// live pod's label is the current one. Pod events and executor lookups key on this ID.
+					if podSubmissionID != "" && app.Status.SubmissionID != podSubmissionID {
+						logger.Info("Adopting SubmissionID from driver pod label",
 							"name", app.Name,
 							"namespace", app.Namespace,
 							"podSubmissionID", podSubmissionID,
-							"appSubmissionID", app.Status.SubmissionID)
-						app.Status.SubmissionID = podSubmissionID
-					} else if app.Status.SubmissionID != "" && podSubmissionID != "" && app.Status.SubmissionID != podSubmissionID {
-						// Log mismatch detection - this indicates a bug
-						logger.Error(nil, "SubmissionID MISMATCH detected - pod updates may be ignored!",
-							"name", app.Name,
-							"namespace", app.Namespace,
 							"appSubmissionID", app.Status.SubmissionID,
-							"podSubmissionID", podSubmissionID,
-							"action", "NOT_RESTORING")
+							"overwroteSubmissionID", app.Status.SubmissionID != "")
+						app.Status.SubmissionID = podSubmissionID
 					}
 					// Preserve the start time and execution attempts from the pod's creation time
 					// since the application is already running

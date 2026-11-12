@@ -875,6 +875,85 @@ var _ = Describe("SparkApplication Controller", func() {
 		})
 	})
 
+	Context("When reconciling a pending rerun SparkApplication whose live driver pod has a different submission ID", func() {
+		ctx := context.Background()
+		appNamespace := "default"
+		staleSubmissionID := "stale-submission-id"
+		podSubmissionID := "pod-submission-id"
+
+		DescribeTable("Should keep the app's submission ID in sync with the live driver pod",
+			func(appName string, podPhase corev1.PodPhase, podLabelSubmissionID string,
+				expectedSubmissionID string, expectedState v1beta2.ApplicationStateType, expectExecutorTracked bool) {
+				key := types.NamespacedName{Name: appName, Namespace: appNamespace}
+
+				app := &v1beta2.SparkApplication{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      appName,
+						Namespace: appNamespace,
+					},
+					Spec: v1beta2.SparkApplicationSpec{
+						MainApplicationFile: util.StringPtr("local:///dummy.jar"),
+					},
+				}
+				v1beta2.SetSparkApplicationDefaults(app)
+				Expect(k8sClient.Create(ctx, app)).To(Succeed())
+				DeferCleanup(func() {
+					Expect(k8sClient.Delete(ctx, app)).To(Succeed())
+				})
+
+				driverPod := createDriverPod(appName, appNamespace)
+				executorPod := createExecutorPod(appName, appNamespace, 1)
+				if podLabelSubmissionID != "" {
+					driverPod.Labels[common.LabelSubmissionID] = podLabelSubmissionID
+					executorPod.Labels[common.LabelSubmissionID] = podLabelSubmissionID
+				}
+				for _, pod := range []*corev1.Pod{driverPod, executorPod} {
+					Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+					DeferCleanup(func() {
+						Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
+					})
+				}
+				driverPod.Status.Phase = podPhase
+				Expect(k8sClient.Status().Update(ctx, driverPod)).To(Succeed())
+				executorPod.Status.Phase = corev1.PodRunning
+				Expect(k8sClient.Status().Update(ctx, executorPod)).To(Succeed())
+
+				// A resubmission created the pods, but its status write was lost, so the app
+				// still carries the submission ID of the invalidated run.
+				app.Status.AppState.State = v1beta2.ApplicationStatePendingRerun
+				app.Status.SubmissionID = staleSubmissionID
+				app.Status.DriverInfo.PodName = driverPod.Name
+				Expect(k8sClient.Status().Update(ctx, app)).To(Succeed())
+
+				reconciler := sparkapplication.NewReconciler(
+					nil,
+					k8sClient.Scheme(),
+					k8sClient,
+					record.NewFakeRecorder(3),
+					nil,
+					sparkapplication.Options{Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 10},
+				)
+				_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+				Expect(app.Status.SubmissionID).To(Equal(expectedSubmissionID))
+				Expect(app.Status.AppState.State).To(Equal(expectedState))
+				if expectExecutorTracked {
+					Expect(app.Status.ExecutorState).To(HaveKey(executorPod.Name))
+				}
+			},
+			Entry("adopts a newer ID from a running driver pod", "test-pending-rerun-sid-running",
+				corev1.PodRunning, podSubmissionID, podSubmissionID, v1beta2.ApplicationStateRunning, true),
+			Entry("adopts a newer ID from a pending driver pod", "test-pending-rerun-sid-pending",
+				corev1.PodPending, podSubmissionID, podSubmissionID, v1beta2.ApplicationStateSubmitted, true),
+			Entry("keeps a matching ID", "test-pending-rerun-sid-match",
+				corev1.PodRunning, staleSubmissionID, staleSubmissionID, v1beta2.ApplicationStateRunning, true),
+			Entry("keeps the app's ID when the pod has no submission ID label", "test-pending-rerun-sid-unlabeled",
+				corev1.PodRunning, "", staleSubmissionID, v1beta2.ApplicationStateRunning, false),
+		)
+	})
+
 	Context("When reconciling a pending rerun SparkApplication with pod being deleted", func() {
 		ctx := context.Background()
 		appName := "test-pending-rerun-deleting"
