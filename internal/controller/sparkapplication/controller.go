@@ -497,8 +497,8 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 					if app.Status.DriverInfo.PodName == "" {
 						app.Status.DriverInfo.PodName = driverPod.Name
 					}
-					// In PENDING_RERUN the app's SubmissionID may belong to the invalidated run, while the
-					// live pod's label is the current one. Pod events and executor lookups key on this ID.
+					// In PENDING_RERUN the app's SubmissionID may belong to a previous run, while the live
+					// pod's label is the current one. Pod events and executor lookups key on this ID.
 					if podSubmissionID != "" && app.Status.SubmissionID != podSubmissionID {
 						logger.Info("Adopting SubmissionID from driver pod label",
 							"name", app.Name,
