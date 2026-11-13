@@ -1,0 +1,101 @@
+name: Publish Onehouse operator image
+
+# Builds and pushes docker.io/onehouse/onehouse-spark-operator, the image the data plane runs.
+# release.yaml publishes the upstream kubeflow/spark-operator image and is not used for this.
+# The data plane pins the tag in infra: terraform/data-plane/spark-resources/spark-operator-values.yaml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag, e.g. v2.1.0.11-dev. Must not exist yet."
+        required: true
+        type: string
+      ref:
+        description: "Git ref to build (branch, tag or SHA)."
+        required: true
+        default: master
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: docker.io/onehouse/onehouse-spark-operator
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Validate tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-dev$ ]]; then
+            echo "::error::tag '${TAG}' must look like v2.1.0.11-dev"
+            exit 1
+          fi
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Resolve commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The same login also pulls the private base image (onehouse/spark-3.5.3-base).
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_KEY }}
+
+      # Tags are never re-pushed: the data plane pulls with pullPolicy Always, so a re-push
+      # would change every running org's operator on its next pod restart, with no rollout.
+      - name: Refuse to overwrite an existing tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if docker buildx imagetools inspect "${IMAGE}:${TAG}" >/dev/null 2>&1; then
+            echo "::error::${IMAGE}:${TAG} already exists; pick the next tag"
+            exit 1
+          fi
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ inputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.commit.outputs.sha }}
+
+      - name: Summary
+        env:
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ steps.commit.outputs.sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Published ${IMAGE}:${TAG}"
+            echo "- commit: \`${SHA}\`"
+            echo "- digest: \`${DIGEST}\`"
+            echo "- platforms: linux/amd64, linux/arm64"
+            echo
+            echo "Next: bump \`image.tag\` in infra \`terraform/data-plane/spark-resources/spark-operator-values.yaml\`."
+          } >> "$GITHUB_STEP_SUMMARY"

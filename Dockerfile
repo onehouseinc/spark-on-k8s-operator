@@ -16,7 +16,7 @@
 
 ARG SPARK_IMAGE=onehouse/spark-3.5.3-base:130825
 
-FROM golang:1.23.12 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.23.12 AS builder
 
 WORKDIR /workspace
 
