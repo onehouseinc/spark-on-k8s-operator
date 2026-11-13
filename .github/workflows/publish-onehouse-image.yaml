@@ -85,6 +85,18 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ steps.commit.outputs.sha }}
 
+      # Keep parity with v2.1.0.10-dev and the base image, which both ship amd64 + arm64.
+      - name: Verify multi-arch manifest
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          platforms=$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest}}' \
+            | jq -r '.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"' | sort -u)
+          echo "${platforms}"
+          for want in linux/amd64 linux/arm64; do
+            grep -qx "${want}" <<< "${platforms}" || { echo "::error::${IMAGE}:${TAG} is missing ${want}"; exit 1; }
+          done
+
       - name: Summary
         env:
           TAG: ${{ inputs.tag }}
